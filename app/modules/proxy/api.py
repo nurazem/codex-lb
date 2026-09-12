@@ -149,6 +149,7 @@ from app.core.openai.models import (
 from app.core.openai.models import (
     OpenAIErrorEnvelope as OpenAIErrorEnvelopeModel,
 )
+from app.core.openai.output_collection import ResponseOutputCollector
 from app.core.openai.parsing import classify_event_type, parse_response_payload
 from app.core.openai.requests import (
     ResponsesCompactRequest,
@@ -9030,7 +9031,7 @@ async def _collect_responses_payload(
     captured_turn_state_headers: dict[str, str] | None = None,
     upstream_stream_false: bool = False,
 ) -> OpenAIResponseResult:
-    output_items: dict[int, dict[str, JsonValue]] = {}
+    output_items = ResponseOutputCollector()
     terminal_result: OpenAIResponseResult | None = None
     nonterminal_result: OpenAIResponsePayload | None = None
     contract_violation_kind: str | None = None
@@ -9043,9 +9044,9 @@ async def _collect_responses_payload(
         if captured_turn_state_headers is not None:
             _capture_response_metadata_turn_state(payload, captured_turn_state_headers)
         event_type = classify_event_type(payload)
-        _collect_output_item_event(payload, output_items)
         if terminal_result is not None:
             continue
+        output_items.add_event(payload)
         if event_type == "error":
             terminal_result = _parse_event_error_envelope(payload)
             continue
@@ -9065,7 +9066,19 @@ async def _collect_responses_payload(
         if event_type in ("response.completed", "response.incomplete", "response.queued", "response.in_progress"):
             response = payload.get("response")
             if is_json_mapping(response):
-                normalized_response, violation_kind = _normalize_public_response_mapping(response, output_items)
+                collected_response = (
+                    output_items.merge(response)
+                    if event_type in ("response.completed", "response.incomplete")
+                    else dict(response)
+                )
+                if collected_response is None:
+                    normalized_response, violation_kind = None, "invalid_output_item"
+                    _record_public_contract_violation(violation_kind)
+                else:
+                    normalized_response, violation_kind = _normalize_public_response_mapping(collected_response)
+                    if violation_kind is not None and collected_response.get("output") != response.get("output"):
+                        # Reconstruction must not silently discard any collected item.
+                        normalized_response = None
                 if violation_kind is not None:
                     contract_violation_kind = contract_violation_kind or violation_kind
                 if normalized_response is not None:
