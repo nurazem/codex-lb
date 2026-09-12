@@ -257,3 +257,13 @@ OpenSpec change first.
 - Post-deploy: correlate retry-circuit `opened`, `half_open`, and `reset` events with bridge `pending` and `response_events_seen` diagnostics. An idle `pending=0` retirement must not precede an immediate two-failure cooldown.
 - Post-deploy: monitor `previous_response_not_found` on `/backend-api/codex/responses`; recurring spikes show repeated continuity failures, which may come from malformed client identifiers, server-side invalidation, or connection lifecycle. Clients should perform the documented full-context retry without `previous_response_id`. Investigate socket-lifecycle remediation only when a separate close-reason, reconnect, or transport diagnostic correlates with the failures.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`
+
+## Non-streaming completed output identity
+
+The non-streaming collector must not use mutable output indexes as item identity. For example, A added at index 8 and completed at index 9 followed by B at index 9 must retain both completed payloads. Index-keyed aggregation instead retains the early A snapshot and overwrites completed A with B.
+
+The collector tracks the first observed index per item ID for ordering and retains only done snapshots for terminal reconstruction. Equal first indexes across identities cannot establish an unambiguous order and fail closed. Identical repeated done snapshots are harmless; conflicting ones fail closed. Opaque fields, including encrypted content and tool arguments, are retained without reconstructing them from deltas.
+
+Non-empty terminal output remains authoritative. Existing public normalization still applies. Queued and in-progress acknowledgements do not require completed items. Errors and failed responses retain their existing handling, and the iterator is drained after the first terminal result so upstream finalization still runs.
+
+This change only alters final JSON collection. Streaming normalization keeps its existing contract. No new configuration or deployment step is required.
