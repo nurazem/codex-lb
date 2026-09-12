@@ -10776,6 +10776,30 @@ Metrics SHALL NOT label raw request, conversation, session, account or API-key i
 - **THEN** its routing diagnostics distinguish that reason
 - **AND** admission counters MUST NOT be represented as successful WS connections
 
+### Requirement: Non-streaming output reconstruction preserves completed item identity
+
+When collecting a non-streaming Responses result whose terminal output is absent, null, or empty, the service MUST reconstruct output from `response.output_item.done` snapshots keyed by non-empty item ID. It MUST include each identity exactly once and preserve its completed payload through existing public output normalization, even when an item's output index changes or a later item reuses that index. Ordering MUST follow each identity's first observed output index. Added snapshots MUST NOT replace completed snapshots.
+
+If reconstruction encounters invalid item identity or index, conflicting completed snapshots for one ID, conflicting item types, repeated function-call IDs across different items, equal first-observed indexes across different identities, or an item without a done snapshot, the service MUST return an `invalid_output_item` upstream error rather than a partial successful result. Reconstructed output MUST pass through the same public output normalization as a terminal output, so item types the public contract does not represent are filtered exactly as they are from a terminal output. A non-empty terminal output MUST remain authoritative and use existing public response validation. Collection MUST retain first-terminal-result semantics and drain the upstream iterator to completion.
+
+#### Scenario: Item index shifts and is reused
+
+- **GIVEN** item A is added at index 8 and completed at index 9, then item B is added and completed at index 9
+- **WHEN** a completed response has null output
+- **THEN** the final JSON output contains completed A and completed B exactly once in that order, retaining both encrypted payloads
+
+#### Scenario: Reconstruction is ambiguous
+
+- **GIVEN** two different completed snapshots share an item ID, or an added item never completes
+- **WHEN** a completed response has empty output
+- **THEN** the service returns an upstream `invalid_output_item` error instead of successful partial output
+
+#### Scenario: Authoritative terminal output
+
+- **GIVEN** streamed item snapshots are incomplete or have conflicting indexes
+- **WHEN** the terminal response contains non-empty valid output
+- **THEN** the service uses that terminal output without merging earlier snapshots
+
 ### Requirement: Observed HTTP response IDs publish same-process ownership before delivery
 
 When an HTTP Responses attempt extracts a valid response ID from an actual upstream lifecycle event, it MUST publish that ID to the existing bounded process owner cache with the selected account and existing API-key/session scope before delivering the event that exposes the ID downstream. An immediate same-process follow-up referencing that ID MUST be able to resolve its known owner without waiting for the originating request-log write or originating stream completion. This readiness MUST apply from the first observed lifecycle event carrying the ID, including `response.created`, `response.queued`, and `response.in_progress`, whether delivered as SSE or adapted from a canonical background JSON acknowledgement; it MUST NOT promise that an unfinished response is already usable by the upstream provider.
