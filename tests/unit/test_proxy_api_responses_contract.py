@@ -2293,3 +2293,125 @@ def test_looks_like_sse_comment_block_fast_path_matches_scan() -> None:
 
     for event_block in blocks:
         assert proxy_api_module._looks_like_sse_comment_block(event_block) is scan(event_block), repr(event_block)
+
+
+def _collection_item_event(kind: str, index: JsonValue, item: dict[str, JsonValue]) -> str:
+    return format_sse_event({"type": "response.output_item." + kind, "output_index": index, "item": item})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unfinished",
+        "conflicting_done",
+        "conflicting_type",
+        "same_index",
+        "missing_id",
+        "bool_index",
+        "negative_index",
+        "duplicate_call_id",
+        "unrepresentable_item",
+    ],
+)
+@pytest.mark.parametrize("authoritative", [False, True])
+async def test_collect_responses_rejects_ambiguous_fallback(case: str, authoritative: bool) -> None:
+    item: dict[str, JsonValue] = {"id": "rs_a", "type": "reasoning", "summary": [], "encrypted_content": "complete-a"}
+    events = [_collection_item_event("done", 0, item)]
+    match case:
+        case "unfinished":
+            events.append(_collection_item_event("added", 1, {**item, "id": "rs_b"}))
+        case "conflicting_done":
+            events.append(_collection_item_event("done", 0, {**item, "encrypted_content": "conflict"}))
+        case "conflicting_type":
+            events.append(_collection_item_event("added", 0, {**item, "type": "message"}))
+        case "same_index":
+            events.append(_collection_item_event("done", 0, {**item, "id": "rs_b"}))
+        case "missing_id":
+            events.append(_collection_item_event("done", 1, {**item, "id": ""}))
+        case "bool_index":
+            events.append(_collection_item_event("done", True, {**item, "id": "rs_b"}))
+        case "negative_index":
+            events.append(_collection_item_event("done", -1, {**item, "id": "rs_b"}))
+        case "unrepresentable_item":
+            events.append(_collection_item_event("done", 1, {"id": "unknown", "type": "unknown"}))
+        case "duplicate_call_id":
+            call: dict[str, JsonValue] = {
+                "type": "function_call",
+                "call_id": "call_a",
+                "name": "example",
+                "arguments": "{}",
+            }
+            events.extend(
+                [
+                    _collection_item_event("done", 1, {**call, "id": "fc_a"}),
+                    _collection_item_event("done", 2, {**call, "id": "fc_b"}),
+                ]
+            )
+    events.append(
+        format_sse_event(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_a",
+                    "status": "completed",
+                    "output": [item] if authoritative else [],
+                },
+            }
+        )
+    )
+    result = await proxy_api_module._collect_responses_payload(_iter_blocks(*events))
+    body = result.model_dump(mode="json", exclude_none=True)
+    if authoritative:
+        assert body["output"] == [item]
+    else:
+        assert body["error"]["code"] == "invalid_output_item"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_type", ["response.completed", "response.incomplete"])
+async def test_collect_responses_preserves_done_payload_order_duplicates_and_first_terminal(terminal_type: str) -> None:
+    call: dict[str, JsonValue] = {
+        "id": "fc_a",
+        "type": "function_call",
+        "call_id": "call_a",
+        "name": "example",
+        "arguments": '{"value":"complete"}',
+        "status": "completed",
+    }
+    message: dict[str, JsonValue] = {
+        "id": "msg_a",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "complete"}],
+    }
+    drained = False
+
+    async def stream() -> AsyncIterator[str]:
+        nonlocal drained
+        for block in [
+            _collection_item_event("done", 9, message),
+            _collection_item_event("done", 3, call),
+            _collection_item_event("done", 4, call),
+            _collection_item_event("added", 4, {**call, "arguments": "", "status": "in_progress"}),
+            format_sse_event(
+                {
+                    "type": terminal_type,
+                    "response": {
+                        "id": "resp_a",
+                        "status": terminal_type.removeprefix("response."),
+                    },
+                }
+            ),
+            _collection_item_event("done", 3, {**call, "arguments": "conflict"}),
+            format_sse_event({"type": "response.failed", "response": {"error": {"code": "later_error"}}}),
+        ]:
+            yield block
+        drained = True
+
+    result = await proxy_api_module._collect_responses_payload(stream())
+    body = result.model_dump(mode="json", exclude_none=True)
+    assert body["output"] == [call, message]
+    assert body["status"] == terminal_type.removeprefix("response.")
+    assert drained

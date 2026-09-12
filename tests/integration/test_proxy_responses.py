@@ -3692,3 +3692,92 @@ async def test_v1_responses_normalizes_tool_messages(async_client, monkeypatch):
         {"type": "function_call_output", "call_id": "call_1", "output": '{"ok":true}'},
         {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/responses", "/v1/responses/"])
+@pytest.mark.parametrize("terminal_output", [None, [], "authoritative"])
+async def test_nonstream_output_preserves_completed_identity(async_client, monkeypatch, path, terminal_output):
+    auth_json = _make_auth_json("acc_identity", "identity@example.com")
+    response = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert response.status_code == 200
+    first = {"id": "rs_a", "type": "reasoning", "summary": [], "encrypted_content": "complete-a"}
+    second = {"id": "rs_b", "type": "reasoning", "summary": [], "encrypted_content": "complete-b"}
+    drained = False
+
+    async def fake_stream(*args, **kwargs):
+        nonlocal drained
+        for kind, index, item in [
+            ("added", 8, {"id": "rs_a", "type": "reasoning", "summary": []}),
+            ("done", 9, first),
+            ("added", 9, {"id": "rs_b", "type": "reasoning", "summary": []}),
+            ("done", 9, second),
+        ]:
+            yield (
+                "data: "
+                + json.dumps({"type": "response.output_item." + kind, "output_index": index, "item": item})
+                + "\n\n"
+            )
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_identity",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [first, second] if terminal_output == "authoritative" else terminal_output,
+                    },
+                }
+            )
+            + "\n\n"
+        )
+        drained = True
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    result = await async_client.post(path, json={"model": "gpt-5.1", "input": "hi", "stream": False})
+    assert result.status_code == 200
+    assert result.json()["output"] == [first, second]
+    assert drained
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/responses", "/v1/responses/"])
+async def test_nonstream_output_conflict_returns_upstream_error(async_client, monkeypatch, path):
+    auth_json = _make_auth_json("acc_conflict", "conflict@example.com")
+    response = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert response.status_code == 200
+    drained = False
+
+    async def fake_stream(*args, **kwargs):
+        nonlocal drained
+        for encrypted in ["complete", "conflict"]:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": "rs_a",
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": encrypted,
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+        yield 'data: {"type":"response.completed","response":{"id":"resp_a","status":"completed","output":[]}}\n\n'
+        drained = True
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    result = await async_client.post(path, json={"model": "gpt-5.1", "input": "hi", "stream": False})
+    assert result.status_code == 502
+    assert result.json()["error"]["code"] == "invalid_output_item"
+    assert drained
