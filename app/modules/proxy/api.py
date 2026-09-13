@@ -302,6 +302,7 @@ from app.modules.proxy.request_policy import (
     validate_model_access,
     validate_top_level_compaction_trigger_input_shape,
 )
+from app.modules.proxy.response_collection import collect_until_disconnect
 from app.modules.proxy.schemas import (
     AccountPoolUsageResponse,
     CodexModelEntry,
@@ -6900,10 +6901,13 @@ async def _collect_responses(
         responses_service_cleanup_ready_event
     )
     try:
-        response_payload = await _collect_responses_payload(
-            stream,
-            captured_turn_state_headers=captured_turn_state_headers,
-            upstream_stream_false=upstream_stream_false,
+        response_payload = await collect_until_disconnect(
+            request,
+            _collect_responses_payload(
+                stream,
+                captured_turn_state_headers=captured_turn_state_headers,
+                upstream_stream_false=upstream_stream_false,
+            ),
         )
     except asyncio.CancelledError:
         if _responses_origin_may_release_reservation(
