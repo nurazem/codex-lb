@@ -10800,6 +10800,30 @@ If reconstruction encounters invalid item identity or index, conflicting complet
 - **WHEN** the terminal response contains non-empty valid output
 - **THEN** the service uses that terminal output without merging earlier snapshots
 
+
+### Requirement: Non-streaming collection owns disconnect settlement
+
+While collecting a synchronous non-streaming Responses result, the proxy MUST observe downstream ASGI disconnect. A disconnect before collection finishes MUST cancel the owned collection once and await its existing cleanup. The observer MUST NOT independently release a reservation owned by the service, trigger failover, or infer remote settlement. A completed collection MUST preserve its result and terminal usage settlement when completion and disconnect become observable together. Request teardown MUST leave no unowned disconnect watcher or collection task.
+
+#### Scenario: Client disconnects before the upstream terminal
+
+- **GIVEN** a non-streaming request has entered its service-owned upstream operation
+- **WHEN** the downstream client disconnects before a terminal response is collected
+- **THEN** the proxy cancels and awaits collection and local stream cleanup
+- **AND** the existing owner settles the API-key reservation exactly once without a replacement upstream attempt
+
+#### Scenario: Completion and disconnect are both observable
+
+- **GIVEN** collection has completed with an authoritative terminal result
+- **WHEN** downstream disconnect is also observed
+- **THEN** the completed result and its established settlement remain authoritative
+- **AND** no second cleanup owner or retry is created
+
+#### Scenario: Other requests remain active
+
+- **GIVEN** multiple independent non-streaming requests are in flight
+- **WHEN** one client disconnects
+- **THEN** its owned work settles without cancelling another request or releasing another request's reservation
 ### Requirement: Observed HTTP response IDs publish same-process ownership before delivery
 
 When an HTTP Responses attempt extracts a valid response ID from an actual upstream lifecycle event, it MUST publish that ID to the existing bounded process owner cache with the selected account and existing API-key/session scope before delivering the event that exposes the ID downstream. An immediate same-process follow-up referencing that ID MUST be able to resolve its known owner without waiting for the originating request-log write or originating stream completion. This readiness MUST apply from the first observed lifecycle event carrying the ID, including `response.created`, `response.queued`, and `response.in_progress`, whether delivered as SSE or adapted from a canonical background JSON acknowledgement; it MUST NOT promise that an unfinished response is already usable by the upstream provider.
