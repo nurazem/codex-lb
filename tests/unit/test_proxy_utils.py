@@ -8528,7 +8528,7 @@ async def test_stream_responses_archives_http_error_before_raising(monkeypatch):
     assert archived[-1]["direction"] == "server_to_codex"
     assert archived[-1]["status_code"] == 429
     assert archived[-1]["payload"] == {
-        "error": {"code": "rate_limit_exceeded", "message": "slow down", "type": "server_error"}
+        "error": {"code": "rate_limit_exceeded", "message": "slow down", "type": "rate_limit_error"}
     }
 
 
