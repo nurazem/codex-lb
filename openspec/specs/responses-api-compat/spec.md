@@ -10832,6 +10832,21 @@ Non-streaming response collection MUST join its existing cleanup owner without r
 - **WHEN** the caller's cancellation scope remains cancelled while owned cleanup waits
 - **THEN** unrelated event-loop tasks continue to run
 - **AND** the original cleanup completes once before collection exits
+
+
+### Requirement: Rebuilt deployment preserves response identity and generic HTTP 429 classification
+
+A replacement image SHALL preserve the observed upstream response ID when normalizing a stream error, unless the error carries its own explicit response ID. A generic HTTP 429 error SHALL be classified as rate_limit_exceeded without overwriting a more specific error code or type.
+
+#### Scenario: An upstream error follows response creation
+- **WHEN** the stream created a response and subsequently emits an error without an explicit response ID
+- **THEN** the normalized terminal error retains the created response ID
+
+#### Scenario: Generic error body accompanies HTTP 429
+- **WHEN** HTTP status 429 accompanies a generic server or upstream error
+- **THEN** the normalized error uses rate_limit_error and rate_limit_exceeded
+- **AND** a specific error code or type is preserved
+
 ### Requirement: Observed HTTP response IDs publish same-process ownership before delivery
 
 When an HTTP Responses attempt extracts a valid response ID from an actual upstream lifecycle event, it MUST publish that ID to the existing bounded process owner cache with the selected account and existing API-key/session scope before delivering the event that exposes the ID downstream. An immediate same-process follow-up referencing that ID MUST be able to resolve its known owner without waiting for the originating request-log write or originating stream completion. This readiness MUST apply from the first observed lifecycle event carrying the ID, including `response.created`, `response.queued`, and `response.in_progress`, whether delivered as SSE or adapted from a canonical background JSON acknowledgement; it MUST NOT promise that an unfinished response is already usable by the upstream provider.

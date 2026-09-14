@@ -1351,6 +1351,15 @@ Each HTTP Responses upstream attempt MUST emit bounded structural console diagno
 - **WHEN** an HTTP SSE or JSON response supplies a recognized terminal response event
 - **THEN** the summary records terminal observation independently of iterator closure
 - **AND** archive capture completeness remains unverified
+
+### Requirement: Native framed progress distinguishes unknown raw bytes
+
+HTTP progress SHALL report raw byte totals as null when the native worker supplies framed events without raw byte observations. Event counts and terminal observations SHALL remain available.
+
+#### Scenario: Native worker frames SSE
+- **WHEN** the Python collector receives a native framed event
+- **THEN** its progress reports observed events without claiming zero raw bytes
+
 ### Requirement: Durable affinity observation on request logs
 
 The system MUST persist `sticky_key_source`, `sticky_kind`, and `sticky_key_hash` on existing Responses and compact request-log rows independently of trace settings. Source MUST describe the existing resolved source classification. Kind and hash MUST describe the resolved affinity policy associated with the logged attempt or final request state. The hash MUST be the first 16 lowercase hexadecimal characters of SHA-256 over the resolved key's UTF-8 bytes. Observation MUST NOT rederive keys, change routing, health, retries, settlement ordering, callback ownership, or persistence drain semantics.

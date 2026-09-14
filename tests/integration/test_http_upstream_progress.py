@@ -62,7 +62,6 @@ async def test_http_attempt_retains_structural_progress(
     monkeypatch.setattr(HttpUpstreamProgress, "body_chunk", observe_chunk)
     settings = proxy.get_settings().model_copy(
         update={
-            "upstream_stream_transport": "http",
             "image_inline_fetch_enabled": False,
             "stream_idle_timeout_seconds": 0.1 if mode == "timeout" else 30.0,
             "trace_channels": frozenset(),
@@ -97,6 +96,7 @@ async def test_http_attempt_retains_structural_progress(
                     }
                 ),
                 headers={},
+                upstream_stream_transport_override="http",
                 access_token="private-token",
                 account_id=None,
                 base_url=f"http://127.0.0.1:{port}",
@@ -156,3 +156,36 @@ async def test_http_attempt_retains_structural_progress(
     )
     assert "private-" not in json.dumps(records)
     assert "never-log-this" not in json.dumps(records)
+
+
+@pytest.mark.asyncio
+async def test_native_framed_progress_does_not_claim_zero_raw_bytes(caplog: pytest.LogCaptureFixture) -> None:
+    from unittest.mock import Mock
+
+    from app.core.clients.native_egress import NativeEgressResponse, SubprocessNativeEgressClient
+
+    events: asyncio.Queue[dict[str, object] | BaseException] = asyncio.Queue()
+    block = 'data: {"type":"response.completed","response":{"id":"native-test"}}\n\n'
+    events.put_nowait({"type": "sse", "text": block, "more": False})
+    events.put_nowait({"type": "end"})
+    client = Mock(spec=SubprocessNativeEgressClient)
+    response = NativeEgressResponse(
+        status=200,
+        http_version="HTTP/2",
+        headers=(("content-type", "text/event-stream"),),
+        client=client,
+        request_id="native-test",
+        generation=1,
+        events=events,
+        sse_framed=True,
+    )
+    progress = HttpUpstreamProgress(body_format="sse")
+    caplog.set_level(logging.INFO, logger="app.core.clients.upstream_progress")
+    assert [
+        event async for event in proxy._iter_sse_events(cast(proxy.SSEResponse, response), 5, 10000, progress=progress)
+    ] == [block]
+    progress.emit("exit", exit_kind="returned")
+    record = json.loads(caplog.records[-1].getMessage().split(" ", 1)[1])
+    assert record["received_bytes"] is None
+    assert record["first_byte_ms"] is None
+    client._finish_request.assert_called_once()

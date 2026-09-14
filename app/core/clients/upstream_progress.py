@@ -27,6 +27,7 @@ class HttpUpstreamProgress:
     last_event_ms: int | None = None
     status_code: int | None = None
     received_bytes: int = 0
+    body_bytes_visible: bool = True
     received_events: int = 0
     terminal_observed: bool = False
 
@@ -49,7 +50,7 @@ class HttpUpstreamProgress:
             "first_event_ms": self.first_event_ms,
             "last_byte_ms": self.last_byte_ms,
             "last_event_ms": self.last_event_ms,
-            "received_bytes": self.received_bytes if self.body_format == "sse" else None,
+            "received_bytes": (self.received_bytes if self.body_format == "sse" and self.body_bytes_visible else None),
             "received_events": self.received_events,
             "terminal_observed": self.terminal_observed,
             "exit_kind": exit_kind,
