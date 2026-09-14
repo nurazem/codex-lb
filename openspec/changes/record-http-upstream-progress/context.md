@@ -38,3 +38,5 @@ finish without spinning or leaking shield callbacks.
 The required container scan also found fixed critical issues in the inherited
 Perl package. The runtime image's existing security-upgrade list now includes
 `perl-base`; rebuilding and scanning the image verifies the package update.
+
+Rebased deployment uses the source-compatible beta.6 production baseline. Native framed SSE is observable at the event boundary only, so raw received-byte totals remain null. This is not a zero-byte stream. The loopback tests select HTTP through the baseline's explicit transport override. Response collection uses the baseline's scheduler seam while preserving cancellation ownership.

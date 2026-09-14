@@ -62,8 +62,8 @@ from app.core.clients.native_egress import (
     discover_native_egress_client,
 )
 from app.core.clients.stream_errors import StreamEventTooLargeError, StreamIdleTimeoutError
-from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.clients.upstream_progress import HttpUpstreamProgress
+from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import Settings, get_settings
 from app.core.conversation_archive import archive_json, archive_text
 from app.core.errors import (
@@ -1447,6 +1447,9 @@ async def _iter_sse_events(
     progress: HttpUpstreamProgress | None = None,
 ) -> AsyncGenerator[str, None]:
     if isinstance(resp, NativeEgressResponse) and resp.sse_framed:
+        if progress is not None:
+            # The native worker owns raw bytes; Python receives framed events.
+            progress.body_bytes_visible = False
         # Rust owns byte framing and upstream activity deadlines for this
         # attempt; waiting for an entire event here would time out active
         # streams that deliver a large event across many partial body reads.
@@ -1876,7 +1879,34 @@ async def _error_response_body(resp: ErrorResponse) -> tuple[object | None, str 
         return None, await resp.text()
 
 
+def _normalize_http_429_detail(status: int, detail: OpenAIErrorDetail) -> None:
+    if status != 429:
+        return
+    if detail.get("type") not in (None, "server_error", "upstream_error", "rate_limit_error"):
+        return
+    if detail.get("code") not in (None, "upstream_error", "server_error", "rate_limit_exceeded"):
+        return
+    detail["type"] = "rate_limit_error"
+    detail["code"] = "rate_limit_exceeded"
+
+
 def _error_event_from_response_body(
+    resp: ErrorResponse, *, data: object | None, text: str | None
+) -> ResponseFailedEvent:
+    event = _unclassified_error_event_from_response_body(resp, data=data, text=text)
+    _normalize_http_429_detail(resp.status, event["response"]["error"])
+    return event
+
+
+def _error_payload_from_response_body(
+    resp: ErrorResponse, *, data: object | None, text: str | None
+) -> OpenAIErrorEnvelope:
+    payload = _unclassified_error_payload_from_response_body(resp, data=data, text=text)
+    _normalize_http_429_detail(resp.status, payload["error"])
+    return payload
+
+
+def _unclassified_error_event_from_response_body(
     resp: ErrorResponse,
     *,
     data: object | None,
@@ -1914,7 +1944,7 @@ async def _error_event_from_response(resp: ErrorResponse) -> ResponseFailedEvent
     return _error_event_from_response_body(resp, data=data, text=text)
 
 
-def _error_payload_from_response_body(
+def _unclassified_error_payload_from_response_body(
     resp: ErrorResponse,
     *,
     data: object | None,
@@ -2126,7 +2156,24 @@ def _normalize_sse_event_block(event_block: str) -> str:
     return normalized
 
 
-def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
+@dataclass
+class _StreamResponseIdentity:
+    response_id: str | None = None
+
+    def observe(self, payload: Mapping[str, JsonValue]) -> None:
+        if self.response_id is not None:
+            return
+        event_type = payload.get("type")
+        response = payload.get("response")
+        if isinstance(event_type, str) and event_type.startswith("response.") and is_json_mapping(response):
+            response_id = response.get("id")
+            if isinstance(response_id, str) and response_id.strip():
+                self.response_id = response_id
+
+
+def _normalize_stream_event_payload(
+    payload: dict[str, JsonValue], *, response_id: str | None = None
+) -> dict[str, JsonValue]:
     event_type = payload.get("type")
     if isinstance(event_type, str) and event_type in _SSE_EVENT_TYPE_ALIASES:
         normalized = dict(payload)
@@ -2137,6 +2184,10 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
     # frames (``type == "error"`` or a top-level ``error`` envelope) so delta
     # frames never reach the pydantic adapter.
     if classify_event_type(payload) == "error" or isinstance(payload.get("error"), dict):
+        explicit_id = payload.get("response_id")
+        failure_response_id = (
+            explicit_id if isinstance(explicit_id, str) and explicit_id.strip() else response_id or get_request_id()
+        )
         error = parse_error_payload(payload)
         if error is not None:
             detail = error.model_dump(exclude_none=True)
@@ -2144,7 +2195,7 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
                 _normalize_error_code(detail.get("code"), detail.get("type")),
                 detail.get("message", "Upstream websocket error"),
                 error_type=detail.get("type") or "server_error",
-                response_id=get_request_id(),
+                response_id=failure_response_id,
                 error_param=detail.get("param"),
             )
             _copy_quota_error_metadata(event["response"]["error"], detail)
@@ -2165,7 +2216,7 @@ def _normalize_stream_event_payload(payload: dict[str, JsonValue]) -> dict[str, 
                     normalized_code,
                     message,
                     error_type=error_type if isinstance(error_type, str) and error_type != "error" else "server_error",
-                    response_id=get_request_id(),
+                    response_id=failure_response_id,
                 ),
             )
     return payload
@@ -2175,7 +2226,12 @@ def _normalize_stream_payload_for_http_block(
     event_block: str,
     *,
     enforce_openai_sdk_contract: bool = True,
+    identity: _StreamResponseIdentity | None = None,
 ) -> tuple[str, str | None]:
+    if identity is not None and identity.response_id is None:
+        observed = parse_sse_data_json(event_block)
+        if observed is not None:
+            identity.observe(observed)
     if isinstance(event_block, NativeResponsesEvent) and not event_block.python_normalization:
         return event_block, event_block.event_type
     # Cheap path for the dominant delta traffic: a canonically framed block
@@ -2203,7 +2259,7 @@ def _normalize_stream_payload_for_http_block(
     payload = parse_sse_data_json(event_block)
     if payload is None:
         return event_block, None
-    normalized = _normalize_stream_event_payload(payload)
+    normalized = _normalize_stream_event_payload(payload, response_id=identity.response_id if identity else None)
     if normalized is payload:
         event_type = normalized.get("type")
         return event_block, event_type if isinstance(event_type, str) else None
@@ -2685,6 +2741,8 @@ async def _stream_websocket_events(
     """
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
 
+    identity = _StreamResponseIdentity()
+
     while True:
         timeout_seconds = idle_timeout_seconds
         if deadline is not None:
@@ -2724,7 +2782,12 @@ async def _stream_websocket_events(
             continue
         if not isinstance(payload, dict):
             continue
-        normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
+        identity.observe(payload)
+        normalized = (
+            payload
+            if not enforce_openai_sdk_contract
+            else _normalize_stream_event_payload(payload, response_id=identity.response_id)
+        )
         raw_event_type = normalized.get("type")
         event_type = raw_event_type if isinstance(raw_event_type, str) else None
         yield format_sse_event(normalized), event_type
@@ -2745,6 +2808,8 @@ async def _stream_codex_websocket_events(
 ) -> AsyncIterator[tuple[str, str | None]]:
     """Yield ``(sse_block, event_type)`` pairs; see ``_stream_websocket_events``."""
     deadline = None if total_timeout_seconds is None else time.monotonic() + total_timeout_seconds
+
+    identity = _StreamResponseIdentity()
 
     while True:
         timeout_seconds = idle_timeout_seconds
@@ -2792,7 +2857,12 @@ async def _stream_codex_websocket_events(
             continue
         if not isinstance(payload, dict):
             continue
-        normalized = payload if not enforce_openai_sdk_contract else _normalize_stream_event_payload(payload)
+        identity.observe(payload)
+        normalized = (
+            payload
+            if not enforce_openai_sdk_contract
+            else _normalize_stream_event_payload(payload, response_id=identity.response_id)
+        )
         raw_event_type = normalized.get("type")
         event_type = raw_event_type if isinstance(raw_event_type, str) else None
         yield format_sse_event(normalized), event_type
@@ -3837,6 +3907,7 @@ async def _stream_responses_with_session(
         progress: HttpUpstreamProgress,
     ) -> AsyncGenerator[str, None]:
         nonlocal status_code, last_stream_activity_at, error_code, error_message, seen_terminal
+        identity = _StreamResponseIdentity()
 
         if route is not None:
             owns_codex_client = codex_client is None
@@ -3954,6 +4025,7 @@ async def _stream_responses_with_session(
                         event_block = _normalize_sse_event_block(event_block)
                         event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
                             event_block,
+                            identity=identity,
                             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                         )
                         if isinstance(normalized_event_type, str) and (
@@ -4117,6 +4189,7 @@ async def _stream_responses_with_session(
                     event_block = _normalize_sse_event_block(event_block)
                     event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
                         event_block,
+                        identity=identity,
                         enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                     )
                     if isinstance(normalized_event_type, str) and (

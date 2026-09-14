@@ -1318,3 +1318,11 @@ Each HTTP Responses upstream attempt MUST emit bounded structural console diagno
 - **WHEN** an HTTP SSE or JSON response supplies a recognized terminal response event
 - **THEN** the summary records terminal observation independently of iterator closure
 - **AND** archive capture completeness remains unverified
+
+### Requirement: Native framed progress distinguishes unknown raw bytes
+
+HTTP progress SHALL report raw byte totals as null when the native worker supplies framed events without raw byte observations. Event counts and terminal observations SHALL remain available.
+
+#### Scenario: Native worker frames SSE
+- **WHEN** the Python collector receives a native framed event
+- **THEN** its progress reports observed events without claiming zero raw bytes

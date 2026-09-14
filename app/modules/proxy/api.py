@@ -8275,10 +8275,18 @@ async def _stream_response_error_events(
         await cleanup.release(action="responses stream cleanup")
 
     saw_downstream_event = False
+    established_response_id: str | None = None
     try:
         async for line in stream:
             if line.startswith("data:") or line.startswith("event:"):
                 saw_downstream_event = True
+            if established_response_id is None:
+                payload = _parse_sse_payload(line)
+                event_type = classify_event_type(payload) if payload is not None else None
+                if payload is not None and isinstance(event_type, str) and event_type.startswith("response."):
+                    # The public normalizer may synthesize response.created
+                    # from an initial in-progress response envelope.
+                    established_response_id = _response_id_from_event_payload(payload)
             yield line
     except ProxyResponseError as exc:
         error_code = exc.payload.get("error", {}).get("code") if isinstance(exc.payload, dict) else None
@@ -8386,8 +8394,8 @@ async def _stream_response_error_events(
             "upstream_unavailable",
         }:
             raise
-        response_id = None
-        if isinstance(exc.payload, dict):
+        response_id = established_response_id
+        if response_id is None and isinstance(exc.payload, dict):
             response_id = _response_id_from_event_payload(cast(dict[str, JsonValue], exc.payload))
         if response_id is None:
             response_id = f"resp_{uuid4().hex}"
@@ -9201,6 +9209,7 @@ async def _normalize_public_responses_stream(
     # we synthesize a ``response.created`` snapshot from the terminal event's
     # ``response`` envelope so the SDK parser can complete the stream.
     created_emitted = False
+    established_response_id: str | None = None
     # Anonymous pre-created events cannot be made SDK-safe until a response
     # envelope arrives: the public OpenAI SDK requires response.created first.
     # Buffer them temporarily. Once an envelope arrives, replay only lightweight
@@ -9293,6 +9302,15 @@ async def _normalize_public_responses_stream(
                     openai_error("stream_incomplete", "Native upstream transport ended before a terminal event"),
                     failure_phase="upstream",
                 )
+            if enforce_openai_sdk_contract and established_response_id is not None:
+                # Native clients manufacture these terminals below this boundary
+                # using a local request ID. Keep the identity already exposed to
+                # the public client; unmarked upstream terminals remain untouched.
+                response = payload.get("response")
+                if payload.get("type") == "response.failed" and is_json_mapping(response):
+                    payload["response"] = {**response, "id": established_response_id}
+                    if "response_id" in payload:
+                        payload["response_id"] = established_response_id
         raw_event_type = payload.get("type")
         if (
             enforce_openai_sdk_contract
@@ -9314,6 +9332,7 @@ async def _normalize_public_responses_stream(
         normalized_payload, violation_kind = _normalize_public_stream_payload(
             payload,
             enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+            established_response_id=established_response_id,
         )
         if violation_kind is not None:
             contract_violation_kind = contract_violation_kind or violation_kind
@@ -9347,6 +9366,7 @@ async def _normalize_public_responses_stream(
                 created_emitted = True
                 yield format_sse_event(normalized_payload)
                 response_id = _response_id_from_event_payload(normalized_payload)
+                established_response_id = response_id
                 for formatted_payload in buffered_pre_created_payloads_to_replay(response_id):
                     yield formatted_payload
                 continue
@@ -9355,6 +9375,7 @@ async def _normalize_public_responses_stream(
                 yield format_sse_event(synthetic_created)
                 created_emitted = True
                 response_id = _response_id_from_event_payload(synthetic_created)
+                established_response_id = response_id
                 for formatted_payload in buffered_pre_created_payloads_to_replay(response_id):
                     yield formatted_payload
             elif _should_buffer_public_pre_created_event(event_type):
@@ -9392,6 +9413,7 @@ async def _normalize_public_responses_stream(
                 normalized_payload,
                 include_created=not created_emitted,
                 sequence_number=next_sequence_number,
+                response_id=established_response_id,
             ):
                 yield formatted_payload
             return
@@ -9442,6 +9464,7 @@ async def _normalize_public_responses_stream(
         error_kind,
         include_created=include_created,
         sequence_number=next_sequence_number if enforce_openai_sdk_contract else None,
+        response_id=established_response_id,
     ):
         yield formatted_payload
 
@@ -9459,13 +9482,14 @@ def _public_response_failed_event_blocks(
     *,
     include_created: bool,
     sequence_number: int | None,
+    response_id: str | None = None,
 ) -> list[str]:
     failed_payload = cast(
         dict[str, JsonValue],
         response_failed_event(
             error_kind,
             _public_contract_error_message(error_kind),
-            response_id=f"resp_{error_kind}",
+            response_id=response_id or f"resp_{error_kind}",
         ),
     )
     if sequence_number is not None:
@@ -9486,6 +9510,7 @@ def _public_response_failed_event_blocks_from_error(
     *,
     include_created: bool,
     sequence_number: int,
+    response_id: str | None = None,
 ) -> list[str]:
     envelope = _parse_event_error_envelope(payload)
     error = envelope.error
@@ -9508,7 +9533,7 @@ def _public_response_failed_event_blocks_from_error(
             error.code or "upstream_error",
             message or "Upstream error",
             error_type or "server_error",
-            response_id=f"resp_{error.code or 'upstream_error'}",
+            response_id=response_id or f"resp_{error.code or 'upstream_error'}",
             error_param=error.param_state,
         ),
     )
@@ -9716,6 +9741,7 @@ def _normalize_public_stream_payload(
     payload: dict[str, JsonValue],
     *,
     enforce_openai_sdk_contract: bool = True,
+    established_response_id: str | None = None,
 ) -> tuple[dict[str, JsonValue] | None, str | None]:
     event_type = classify_event_type(payload)
     if event_type == "response.reasoning_summary_text.done" and isinstance(payload.get("text"), str):
@@ -9749,7 +9775,9 @@ def _normalize_public_stream_payload(
             nested_error = response.get("error") if isinstance(response, dict) else None
             parsed_error = _parse_event_error_envelope({"error": nested_error})
         if enforce_openai_sdk_contract and _is_previous_response_not_found_public_error(parsed_error.error):
-            response_id = _response_id_from_event_payload(payload) if event_type == "response.failed" else None
+            response_id = (
+                _response_id_from_event_payload(payload) if event_type == "response.failed" else established_response_id
+            )
             return (
                 cast(
                     dict[str, JsonValue],
@@ -9774,6 +9802,7 @@ def _normalize_public_stream_payload(
                     response_failed_event(
                         "invalid_json",
                         _public_contract_error_message("invalid_json"),
+                        response_id=established_response_id,
                     ),
                 ),
                 "invalid_json",
@@ -9787,6 +9816,7 @@ def _normalize_public_stream_payload(
                     response_failed_event(
                         error_kind,
                         _public_contract_error_message(error_kind),
+                        response_id=established_response_id,
                     ),
                 ),
                 error_kind,
