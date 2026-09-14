@@ -2,6 +2,7 @@
 
 import asyncio
 
+import anyio
 import pytest
 from starlette.requests import Request
 
@@ -73,6 +74,41 @@ async def test_repeated_caller_cancel_does_not_interrupt_cleanup():
         await owner
     assert closed.is_set()
     assert cancellations == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_level_cancelled_asgi_scope_allows_cleanup_to_finish() -> None:
+    started = asyncio.Event()
+    closing = asyncio.Event()
+    release = asyncio.Event()
+    closed = asyncio.Event()
+    scopes: list[anyio.CancelScope] = []
+
+    async def operation() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closing.set()
+            await release.wait()
+            closed.set()
+
+    async def owner() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await collect_until_disconnect(request_for(asyncio.Event()), operation())
+
+    task = asyncio.create_task(owner())
+    await started.wait()
+    scopes[0].cancel()
+    await closing.wait()
+    # This task can run while the collector's outer scope stays cancelled.
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    await task
+    assert closed.is_set()
 
 
 @pytest.mark.asyncio

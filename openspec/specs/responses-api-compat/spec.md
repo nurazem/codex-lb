@@ -10824,6 +10824,14 @@ While collecting a synchronous non-streaming Responses result, the proxy MUST ob
 - **GIVEN** multiple independent non-streaming requests are in flight
 - **WHEN** one client disconnects
 - **THEN** its owned work settles without cancelling another request or releasing another request's reservation
+
+### Requirement: Non-streaming disconnect cleanup tolerates level cancellation
+Non-streaming response collection MUST join its existing cleanup owner without repeatedly cancelling that owner. The join MUST tolerate both repeated task cancellation and a level-cancelled ASGI scope without callback accumulation or a busy loop. It MUST preserve the caller cancellation after cleanup and retain the existing completed-result precedence.
+
+#### Scenario: ASGI cancellation persists during cleanup
+- **WHEN** the caller's cancellation scope remains cancelled while owned cleanup waits
+- **THEN** unrelated event-loop tasks continue to run
+- **AND** the original cleanup completes once before collection exits
 ### Requirement: Observed HTTP response IDs publish same-process ownership before delivery
 
 When an HTTP Responses attempt extracts a valid response ID from an actual upstream lifecycle event, it MUST publish that ID to the existing bounded process owner cache with the selected account and existing API-key/session scope before delivering the event that exposes the ID downstream. An immediate same-process follow-up referencing that ID MUST be able to resolve its known owner without waiting for the originating request-log write or originating stream completion. This readiness MUST apply from the first observed lifecycle event carrying the ID, including `response.created`, `response.queued`, and `response.in_progress`, whether delivered as SSE or adapted from a canonical background JSON acknowledgement; it MUST NOT promise that an unfinished response is already usable by the upstream provider.
