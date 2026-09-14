@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import logging
-from collections.abc import Awaitable, Callable
+import time
 from datetime import datetime, timezone
-from typing import Protocol, TypeVar, cast
 
-from app.core.config.settings import get_settings
+from app.core.config.settings_cache import get_settings_cache
+from app.core.resilience.toggles import resolve_resilience_toggles
+from app.core.scheduling.leader_election_handle import get_leader_election as _get_leader_election
 from app.core.utils.time import to_utc_naive
 from app.db.session import get_background_session
 from app.modules.accounts.repository import AccountsRepository
-from app.modules.proxy.load_balancer import _build_states
+from app.modules.proxy.load_balancer import _build_states, effective_routing_tunables
 from app.modules.quota_planner.logic import build_demand_forecast, plan_shadow_actions, simulate_pool
 from app.modules.quota_planner.repository import QuotaPlannerRepository
 from app.modules.quota_planner.warmup import QuotaWarmupService
@@ -24,18 +24,6 @@ logger = logging.getLogger(__name__)
 # keeps ``interval_seconds`` as a constructor field so tests can exercise the
 # loop with a short interval.
 _TICK_SECONDS = 300
-
-
-_T = TypeVar("_T")
-
-
-class _LeaderElectionLike(Protocol):
-    async def run_if_leader(self, fn: Callable[[], Awaitable[_T]]) -> _T | None: ...
-
-
-def _get_leader_election() -> _LeaderElectionLike:
-    module = importlib.import_module("app.core.scheduling.leader_election")
-    return cast(_LeaderElectionLike, module.get_leader_election())
 
 
 class QuotaPlannerScheduler:
@@ -74,14 +62,26 @@ class QuotaPlannerScheduler:
                 pass
 
     async def run_once(self) -> None:
-        await _get_leader_election().run_if_leader(self._run_once_as_leader)
+        started = time.monotonic()
+        ran = await _get_leader_election().run_if_leader(self._run_once_as_leader)
+        if ran is not None:
+            # Tick cost surfaced next to the event-loop lag monitor: the body
+            # runs on the serving loop, so a slow tick is a serving stall.
+            logger.info(
+                "Quota planner tick completed duration_ms=%d",
+                int((time.monotonic() - started) * 1000),
+            )
 
-    async def _run_once_as_leader(self) -> None:
+    async def _run_once_as_leader(self) -> bool:
+        # One dashboard-settings snapshot per tick, taken before the session and
+        # outside any runtime lock: the account states below resolve soft drain
+        # and the routing tunables from it, not from the environment layer.
+        dashboard_settings = await get_settings_cache().get()
         async with get_background_session() as session:
             planner_repo = QuotaPlannerRepository(session)
             settings = await planner_repo.get_settings()
             if settings.mode == "off":
-                return
+                return False
             warmup_service = QuotaWarmupService(session)
             await self._reconcile_expired_warmup_claims(planner_repo=planner_repo, warmup_service=warmup_service)
             accounts_repo = AccountsRepository(session)
@@ -96,10 +96,12 @@ class QuotaPlannerScheduler:
                 latest_secondary=latest_secondary,
                 latest_monthly=latest_monthly,
                 runtime={},
+                routing_tunables=effective_routing_tunables(dashboard_settings),
+                soft_drain_enabled=resolve_resilience_toggles(dashboard_settings).soft_drain_enabled,
             )
             now = datetime.now(timezone.utc)
-            demand_bins = await planner_repo.aggregate_demand_bins()
-            forecast = build_demand_forecast(settings=settings, bins=demand_bins, now=now)
+            demand_slots = await planner_repo.aggregate_demand_slot_units()
+            forecast = build_demand_forecast(settings=settings, slot_units=demand_slots, now=now)
             base_simulation = simulate_pool(settings=settings, states=states, demand_forecast=forecast, now=now)
             actions = plan_shadow_actions(settings=settings, states=states, demand_forecast=forecast, now=now)
             if not actions:
@@ -127,7 +129,7 @@ class QuotaPlannerScheduler:
                         separators=(",", ":"),
                     ),
                 )
-                return
+                return True
             scenario = simulate_pool(
                 settings=settings,
                 states=states,
@@ -178,6 +180,7 @@ class QuotaPlannerScheduler:
                     # An expired executing row is reclaimed inside warm_now;
                     # a still-live executing row is read back and left alone.
                     await warmup_service.warm_now(account_id=action.account_id, decision_id=decision.id)
+            return True
 
     async def _reconcile_expired_warmup_claims(
         self,
@@ -191,8 +194,5 @@ class QuotaPlannerScheduler:
 
 
 def build_quota_planner_scheduler() -> QuotaPlannerScheduler:
-    settings = get_settings()
-    return QuotaPlannerScheduler(
-        interval_seconds=_TICK_SECONDS,
-        enabled=getattr(settings, "quota_planner_scheduler_enabled", True),
-    )
+    # ``quota_planner_settings.mode == "off"`` (dashboard) is the only switch.
+    return QuotaPlannerScheduler(interval_seconds=_TICK_SECONDS, enabled=True)

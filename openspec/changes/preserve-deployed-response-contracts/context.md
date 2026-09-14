@@ -1,0 +1,11 @@
+# Source alignment and validation
+
+Production's Python source matches c0beaaadd96a89f0240582b5449bf4dd50647c7d except seven scoped proxy files. The existing fork patches were reapplied to that baseline, preserving the deployed error response identity and generic 429 normalization changes. No database migrations were added or rewritten.
+
+A consistent read-only logical backup of production restored successfully and passed integrity_check. The rebased application recognizes revision 20260909_070000_automation_run_claim_budget; upgrade head leaves that revision unchanged and the canonical check reports migration_policy=ok and schema_drift=none. The older fork head was rejected by this check and was not deployed.
+
+The earlier fork's full test evidence does not qualify the rebased source. On the rebased tree: 115 route/collector contract tests passed in the first focused run; five HTTP loopback tests exposed a moved transport-selection test interface. After selecting HTTP explicitly and adopting the scheduler seam, all 14 loopback/disconnect/cleanup controls passed. Seven final HTTP progress controls, including native framed-byte visibility, passed. The complete amd64 image passed a critical-vulnerability scan, schema verification against a restored production copy, and isolated startup on both build and deployment hosts. Broader test gates are still being completed.
+
+The deployed source and database backup are held privately. No credentials, provider bodies or operator archives are included in this repository.
+
+On 2026-09-14 at 07:42 UTC, source af041799d2fe6a90786a47c08434444f73beae0f was deployed using image config digest 837c4e952860940479b58676e44244e3ac18f6c84d8e7730560281f25ec9c603. Effective image configuration, platform and layers were verified across transfer; the local OCI index digest was retained separately. Direct readiness and the Caddy upstream route report a healthy database and one active ring member. No database migration was needed. JSON logs are bounded to five 10 MB files, with a 660-second graceful stop allowance. The old compose, image, database snapshot and complete outgoing log are held privately for rollback and investigation. Later test/documentation changes do not alter the deployed application bytes.

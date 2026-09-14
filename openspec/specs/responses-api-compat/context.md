@@ -16,6 +16,14 @@ See `openspec/specs/responses-api-compat/spec.md` for normative requirements.
 
 ## Constraints
 
+- Public-contract SSE filtering uses the `response.*` and `error` families, so
+  diagnostics such as `responsesapi.websocket_timing` cannot interrupt strict
+  client event deserializers. For example, a timing diagnostic between a text
+  delta and `response.completed` is removed while both standard events remain.
+  Native Codex requests retain vendor events; OpenAI-shaped backend requests
+  follow public filtering. This does not normalize string-valued
+  `response.instructions` or establish full IntelliJ compatibility (Refs #1934).
+
 - Upstream limitations determine available modalities, tool output, and overflow handling.
 - `store=true` is rejected; responses are not persisted.
 - `include` values must be on the documented allowlist.
@@ -257,3 +265,45 @@ OpenSpec change first.
 - Post-deploy: correlate retry-circuit `opened`, `half_open`, and `reset` events with bridge `pending` and `response_events_seen` diagnostics. An idle `pending=0` retirement must not precede an immediate two-failure cooldown.
 - Post-deploy: monitor `previous_response_not_found` on `/backend-api/codex/responses`; recurring spikes show repeated continuity failures, which may come from malformed client identifiers, server-side invalidation, or connection lifecycle. Clients should perform the documented full-context retry without `previous_response_id`. Investigate socket-lifecycle remediation only when a separate close-reason, reconnect, or transport diagnostic correlates with the failures.
 - Websocket/Codex CLI tier verification runbook: `openspec/specs/responses-api-compat/ops.md`
+
+
+## HTTP continuation promotion
+
+Healthy native HTTP requests use normal policy. The proxy cannot infer every
+client-local WebSocket failure from HTTP alone; it uses its existing 60-second
+upstream-connect failure marker as concrete failure evidence. Operator HTTP
+pins, image and size bypasses remain effective. No new retry/session registry.
+
+History-only locality is soft, scoped by the bridge's full API-key identifier,
+and hashes the complete first user item plus instructions and model. No client
+prompt cache field is overwritten. Identical initial prompts may share an idle
+connection, but neither histories nor response anchors are merged; the complete
+request is sent each time. Existing hard-continuity paths retain their guarded
+incremental replay. Conversation IDs get their own hashed locality and are never
+combined with an injected previous_response_id.
+
+Chat keeps the existing stream conversion/usage/error/cleanup pipeline and uses
+the bridge only after the source-routing branch. Backend stream=false retains
+its native non-streaming upstream contract. No claimed latency percentage:
+connection reuse is measured separately from admission and successful transport.
+
+For example, a Chat client sending `[user(task), assistant(answer), user(next)]`
+without session headers can open a bridge connection. Appending the next
+assistant/user pair reuses that connection while sending the entire new history.
+The same initial task under a different API key selects a separate connection.
+
+Chat binds existing settlement ownership signals while advancing its bridged
+stream. Predispatch failures and cancellation release origin-owned reservations;
+accepted or delivery-ambiguous owner forwards retain their settlement owner.
+Context bindings do not span yields because startup probes and consumers may
+advance the stream from different tasks.
+
+## Non-streaming completed output identity
+
+The non-streaming collector must not use mutable output indexes as item identity. For example, A added at index 8 and completed at index 9 followed by B at index 9 must retain both completed payloads. Index-keyed aggregation instead retains the early A snapshot and overwrites completed A with B.
+
+The collector tracks the first observed index per item ID for ordering and retains only done snapshots for terminal reconstruction. Equal first indexes across identities cannot establish an unambiguous order and fail closed. Identical repeated done snapshots are harmless; conflicting ones fail closed. Opaque fields, including encrypted content and tool arguments, are retained without reconstructing them from deltas.
+
+Non-empty terminal output remains authoritative. Existing public normalization still applies. Queued and in-progress acknowledgements do not require completed items. Errors and failed responses retain their existing handling, and the iterator is drained after the first terminal result so upstream finalization still runs.
+
+This change only alters final JSON collection. Streaming normalization keeps its existing contract. No new configuration or deployment step is required.

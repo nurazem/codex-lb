@@ -125,13 +125,8 @@ def _disable_http_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
         proxy_request_budget_seconds=75.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,
-        upstream_compact_timeout_seconds=None,
-        upstream_stream_transport="auto",
         stream_idle_timeout_seconds=300.0,
-        proxy_token_refresh_limit=32,
-        proxy_upstream_websocket_connect_limit=64,
         proxy_response_create_limit=64,
-        proxy_compact_response_create_limit=16,
     )
     dashboard_settings = DashboardSettings(
         id=1,
@@ -1138,6 +1133,76 @@ async def test_proxy_responses_openai_shape_custom_client_gets_sdk_sse_contract(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "native"),
+    [
+        ("/v1/responses", False),
+        ("/v1/responses/", False),
+        ("/backend-api/codex/responses", False),
+        ("/backend-api/codex/responses/", False),
+        ("/backend-api/codex/responses", True),
+        ("/backend-api/codex/responses/", True),
+    ],
+    ids=["v1", "v1-slash", "backend-public", "backend-public-slash", "backend-native", "backend-native-slash"],
+)
+async def test_responses_routes_filter_vendor_events_only_for_public_contract(async_client, monkeypatch, route, native):
+    auth_json = _make_auth_json("acc_vendor_events", "vendor-events@example.com")
+    response = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert response.status_code == 200
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kw):
+        yield 'data: {"type":"codex.rate_limits","plan_type":"pro","rate_limits":{"allowed":true}}\n\n'
+        yield (
+            'event: response.created\ndata: {"type":"response.created","sequence_number":0,'
+            '"response":{"id":"resp_vendor","object":"response","status":"in_progress",'
+            '"instructions":"Keep this string.","output":[]}}\n\n'
+        )
+        yield (
+            'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","sequence_number":1,'
+            '"item_id":"msg_vendor","output_index":0,"content_index":0,"delta":"Commit message"}\n\n'
+        )
+        yield 'event: responsesapi.websocket_timing\ndata: {"type":"responsesapi.websocket_timing","latency_ms":12}\n\n'
+        yield (
+            'event: response.completed\ndata: {"type":"response.completed","sequence_number":2,'
+            '"response":{"id":"resp_vendor","object":"response","status":"completed","output":[]}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    payload = {"model": "gpt-5.1", "input": "hi", "stream": True}
+    if native:
+        payload["instructions"] = "hi"
+    async with async_client.stream(
+        "POST",
+        route,
+        json=payload,
+        headers={"accept": "text/event-stream", "user-agent": "codex-cli/1.0" if native else "custom-client/1.0"},
+    ) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = list(_iter_sse_events(lines))
+    event_types = [event["type"] for event in events]
+    if native:
+        assert event_types == [
+            "codex.rate_limits",
+            "response.created",
+            "response.output_text.delta",
+            "responsesapi.websocket_timing",
+            "response.completed",
+        ]
+    else:
+        assert event_types == ["response.created", "response.output_text.delta", "response.completed"]
+    created = next(event for event in events if event["type"] == "response.created")
+    assert created["response"]["instructions"] == "Keep this string."
+    delta = next(event for event in events if event["type"] == "response.output_text.delta")
+    assert delta["delta"] == "Commit message"
+    assert events[-1]["response"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_proxy_responses_null_instructions_gets_sdk_sse_contract(async_client, monkeypatch):
     email = "backend-openai-null-instructions@example.com"
     raw_account_id = "acc_backend_openai_null_instructions"
@@ -1868,19 +1933,13 @@ async def test_v1_responses_default_smart_policy_routes_http_downstream_by_stick
         proxy_request_budget_seconds=75.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,
-        upstream_compact_timeout_seconds=None,
-        upstream_stream_transport="auto",
-        http_downstream_transport_policy="smart",
         stream_idle_timeout_seconds=300.0,
-        proxy_token_refresh_limit=32,
-        proxy_upstream_websocket_connect_limit=64,
         proxy_response_create_limit=64,
-        proxy_compact_response_create_limit=16,
     )
     dashboard_settings = DashboardSettings(
         id=1,
         sticky_threads_enabled=False,
-        upstream_stream_transport="default",
+        upstream_stream_transport="auto",
         http_downstream_transport_policy="smart",
         prefer_earlier_reset_accounts=False,
         routing_strategy="usage_weighted",
@@ -1965,19 +2024,13 @@ async def test_v1_responses_upstream_transport_metric_counts_terminal_errors(
         proxy_request_budget_seconds=75.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,
-        upstream_compact_timeout_seconds=None,
-        upstream_stream_transport="auto",
-        http_downstream_transport_policy="smart",
         stream_idle_timeout_seconds=300.0,
-        proxy_token_refresh_limit=32,
-        proxy_upstream_websocket_connect_limit=64,
         proxy_response_create_limit=64,
-        proxy_compact_response_create_limit=16,
     )
     dashboard_settings = DashboardSettings(
         id=1,
         sticky_threads_enabled=False,
-        upstream_stream_transport="default",
+        upstream_stream_transport="auto",
         http_downstream_transport_policy="smart",
         prefer_earlier_reset_accounts=False,
         routing_strategy="usage_weighted",
@@ -2056,13 +2109,8 @@ async def test_v1_responses_without_http_bridge_honors_explicit_websocket_upstre
         proxy_request_budget_seconds=75.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,
-        upstream_compact_timeout_seconds=None,
-        upstream_stream_transport="auto",
         stream_idle_timeout_seconds=300.0,
-        proxy_token_refresh_limit=32,
-        proxy_upstream_websocket_connect_limit=64,
         proxy_response_create_limit=64,
-        proxy_compact_response_create_limit=16,
     )
     dashboard_settings = DashboardSettings(
         id=1,
@@ -2086,11 +2134,8 @@ async def test_v1_responses_without_http_bridge_honors_explicit_websocket_upstre
 
     class _CoreProxySettings:
         upstream_base_url = "https://chatgpt.com/backend-api"
-        upstream_stream_transport = "default"
         upstream_connect_timeout_seconds = 8.0
         stream_idle_timeout_seconds = 45.0
-        max_sse_event_bytes = 1024
-        image_inline_fetch_enabled = False
         proxy_request_budget_seconds = 75.0
         trace_channels = frozenset()
 
@@ -2159,13 +2204,8 @@ async def test_v1_responses_without_http_bridge_http_upstream_preserves_historic
         proxy_request_budget_seconds=75.0,
         compact_request_budget_seconds=75.0,
         transcription_request_budget_seconds=120.0,
-        upstream_compact_timeout_seconds=None,
-        upstream_stream_transport="auto",
         stream_idle_timeout_seconds=300.0,
-        proxy_token_refresh_limit=32,
-        proxy_upstream_websocket_connect_limit=64,
         proxy_response_create_limit=64,
-        proxy_compact_response_create_limit=16,
     )
     dashboard_settings = DashboardSettings(
         id=1,
@@ -2188,11 +2228,8 @@ async def test_v1_responses_without_http_bridge_http_upstream_preserves_historic
 
     class _CoreProxySettings:
         upstream_base_url = "https://chatgpt.com/backend-api"
-        upstream_stream_transport = "default"
         upstream_connect_timeout_seconds = 8.0
         stream_idle_timeout_seconds = 45.0
-        max_sse_event_bytes = 1024
-        image_inline_fetch_enabled = False
         proxy_request_budget_seconds = 75.0
         trace_channels = frozenset()
 
@@ -3692,3 +3729,204 @@ async def test_v1_responses_normalizes_tool_messages(async_client, monkeypatch):
         {"type": "function_call_output", "call_id": "call_1", "output": '{"ok":true}'},
         {"role": "user", "content": [{"type": "input_text", "text": "continue"}]},
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("terminal_includes_output", [False, True])
+@pytest.mark.parametrize("unknown_output", [False, True])
+async def test_public_responses_preserves_tool_search_output(
+    async_client, monkeypatch, stream: bool, terminal_includes_output: bool, unknown_output: bool
+):
+    auth_json = _make_auth_json("acc_tool_search_output", "tool-search@example.com")
+    response = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert response.status_code == 200
+    loaded_tool = {
+        "type": "function",
+        "name": "calculate_total",
+        "defer_loading": True,
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "required": ["a"],
+            "additionalProperties": False,
+        },
+    }
+    items = [
+        {
+            "type": "tool_search_call",
+            "id": "tsc_search",
+            "call_id": "call_search",
+            "execution": "server",
+            "status": "completed",
+            "arguments": {"query": "calculate total"},
+        },
+        {
+            "type": "tool_search_output",
+            "id": "tso_loaded",
+            "call_id": "call_search",
+            "execution": "server",
+            "status": "completed",
+            "tools": [loaded_tool],
+        },
+        {
+            "type": "function_call",
+            "id": "fc_loaded",
+            "call_id": "call_function",
+            "name": "calculate_total",
+            "arguments": '{"a":23}',
+            "status": "completed",
+        },
+    ]
+    # This recognized item must not make arbitrary unknown output types pass through.
+    unknown_item = {"type": "unknown_result", "id": "unknown_item", "payload": {"value": "opaque"}}
+    upstream_items = [*items, unknown_item] if unknown_output else items
+
+    async def fake_stream(payload, headers, access_token, account_id, **kwargs):
+        del payload, headers, access_token, account_id, kwargs
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.created",
+                    "response": {"id": "resp_search", "object": "response", "status": "in_progress", "output": []},
+                }
+            )
+            + "\n\n"
+        )
+        for index, item in enumerate(upstream_items):
+            for event_type in ("response.output_item.added", "response.output_item.done"):
+                yield "data: " + json.dumps({"type": event_type, "output_index": index, "item": item}) + "\n\n"
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_search",
+                        "object": "response",
+                        "status": "completed",
+                        "output": upstream_items if terminal_includes_output else [],
+                        "usage": {"input_tokens": 3, "output_tokens": 5},
+                    },
+                }
+            )
+            + "\n\n"
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    response = await async_client.post(
+        "/v1/responses", json={"model": "gpt-5.4", "instructions": "", "input": "Discover the tool.", "stream": stream}
+    )
+    if unknown_output and not stream and not terminal_includes_output:
+        # Missing terminal output requires complete, representable done snapshots.
+        # Dropping an unknown item here would falsely report a partial success.
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "invalid_output_item"
+        return
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ") and line != "data: [DONE]"
+        ]
+        for event_type in ("response.output_item.added", "response.output_item.done"):
+            assert [event["item"] for event in events if event.get("type") == event_type] == items
+        completed = next(event["response"] for event in events if event.get("type") == "response.completed")
+    else:
+        assert response.headers["content-type"].startswith("application/json")
+        completed = response.json()
+    assert completed["output"] == items
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/responses", "/v1/responses/"])
+@pytest.mark.parametrize("terminal_output", [None, [], "authoritative"])
+async def test_nonstream_output_preserves_completed_identity(async_client, monkeypatch, path, terminal_output):
+    auth_json = _make_auth_json("acc_identity", "identity@example.com")
+    response = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert response.status_code == 200
+    first = {"id": "rs_a", "type": "reasoning", "summary": [], "encrypted_content": "complete-a"}
+    second = {"id": "rs_b", "type": "reasoning", "summary": [], "encrypted_content": "complete-b"}
+    drained = False
+
+    async def fake_stream(*args, **kwargs):
+        nonlocal drained
+        for kind, index, item in [
+            ("added", 8, {"id": "rs_a", "type": "reasoning", "summary": []}),
+            ("done", 9, first),
+            ("added", 9, {"id": "rs_b", "type": "reasoning", "summary": []}),
+            ("done", 9, second),
+        ]:
+            yield (
+                "data: "
+                + json.dumps({"type": "response.output_item." + kind, "output_index": index, "item": item})
+                + "\n\n"
+            )
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_identity",
+                        "object": "response",
+                        "status": "completed",
+                        "output": [first, second] if terminal_output == "authoritative" else terminal_output,
+                    },
+                }
+            )
+            + "\n\n"
+        )
+        drained = True
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    result = await async_client.post(path, json={"model": "gpt-5.1", "input": "hi", "stream": False})
+    assert result.status_code == 200
+    assert result.json()["output"] == [first, second]
+    assert drained
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/responses", "/v1/responses/"])
+async def test_nonstream_output_conflict_returns_upstream_error(async_client, monkeypatch, path):
+    auth_json = _make_auth_json("acc_conflict", "conflict@example.com")
+    response = await async_client.post(
+        "/api/accounts/import", files={"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    )
+    assert response.status_code == 200
+    drained = False
+
+    async def fake_stream(*args, **kwargs):
+        nonlocal drained
+        for encrypted in ["complete", "conflict"]:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": 0,
+                        "item": {
+                            "id": "rs_a",
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": encrypted,
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+        yield 'data: {"type":"response.completed","response":{"id":"resp_a","status":"completed","output":[]}}\n\n'
+        drained = True
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    result = await async_client.post(path, json={"model": "gpt-5.1", "input": "hi", "stream": False})
+    assert result.status_code == 502
+    assert result.json()["error"]["code"] == "invalid_output_item"
+    assert drained

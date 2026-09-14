@@ -37,7 +37,7 @@ If a thread's owner account becomes unavailable, requests that still require tha
 - **Primary quota** is the short **5-hour** usage window.
 - **Secondary quota** is the longer window: **weekly** on most plans, or **monthly** on plans that report only a monthly window (the monthly window is normalized into the secondary slot for routing).
 
-Account pages display each window as **percent remaining**; the sticky reallocation thresholds in Settings are **percent used**. A `Sticky secondary threshold` of `70` means "move sticky sessions off an account once more than 70% of its secondary (weekly or monthly) window has been used" — in quota terms, once less than 30% remains. Note that routing evaluates thresholds against reported usage **plus temporary in-flight pressure** (concurrent requests and leased tokens), so reallocation can begin slightly before the raw account-page numbers reach the threshold.
+Account pages display each window as **percent remaining**; the sticky reallocation thresholds in Settings are **percent used**. A `Sticky secondary threshold` of `70` means "move sticky sessions off an account once more than 70% of its secondary (weekly or monthly) window has been used" — in quota terms, once less than 30% remains. Note that routing evaluates thresholds against reported usage **plus temporary in-flight pressure** (concurrent requests and leased tokens), so reallocation can begin slightly before the raw account-page numbers reach the threshold. The size of that pressure (in-flight penalty per request, leased-token weight), the account lease TTL, the overload isolation window and the error-rate weighting switch are dashboard settings under **Settings → Advanced → Routing weights and overload isolation**; a field left empty inherits the environment value or the default.
 
 ### Prefer earlier reset
 
@@ -47,6 +47,75 @@ When enabled and several accounts are otherwise eligible, selection is restricte
 
 Limit warm-up sends **one small real request** (using the configured warm-up model and prompt) to an opted-in account when one of its quota windows is confirmed to have newly reset, verifying that the account responds. It consumes a small amount of quota. The optional staggered idle mode additionally pre-starts the 5h window of idle opted-in accounts before traffic arrives; the configured cooldown applies to these staggered idle probes, while ordinary reset-confirmed probes fire once per confirmed reset. Accounts opt in individually (`Enable warm-up` in account actions); the last attempt's result, model, and time are shown on the account list entry.
 
+## Subscription-exhaustion overflow to a model source
+
+> Shipping in stages. This release ships the designation control and its preflight so a source can be prepared; the overflow routing described below lands in a later release and is not active until then. Owning spec: [model-source-routing](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/model-source-routing); design: issue [#2123](https://github.com/Soju06/codex-lb/issues/2123), which supersedes the earlier proposals in #428 and #1664.
+
+**Settings → Routing → "Overflow to model source when all subscription accounts are exhausted"** designates one OpenAI-compatible model source with Responses support as the place new requests go when the whole subscription pool is out of usage. It is **orthogonal to `Routing strategy`**: the strategy still decides which subscription account serves a request while any account can; overflow only answers the question "what happens when none can". Default **off**; the setting names an operator-owned paid source, so it can never be a default.
+
+### Trigger
+
+Overflow triggers only on **pool-wide usage exhaustion** — the exact condition that today returns `429 usage_limit_reached` with `resets_at` (every eligible account is `QUOTA_EXCEEDED` or `RATE_LIMITED` with used ≥ 100 % evidence). It never triggers on per-account capacity caps, API-key fair-share throttles, transient upstream errors, authentication failures, or a single account's rate limit: those keep their current answers.
+
+### Eligibility
+
+- New conversations, or requests without prior reasoning, on standard Responses models. The **gpt-5.6 family cannot overflow in this version** (its Responses-Lite / code-mode request bodies are not portable to an OpenAI-compatible source); the preflight marks those models.
+- Unscoped API keys only. A key scoped to a set of sources already routes to them directly and never overflows; the preflight counts such keys.
+- Background jobs never overflow.
+- Declare the non-function tool types your source accepts (`custom`, `apply_patch`, `web_search`, `shell`, `tool_search`) on its model entries (`supports_search_tool`, `experimental_supported_tools` in the model's raw metadata). The preflight lists the undeclared types per model, together with missing vision, missing streaming, missing pricing (the cost tile shows $0) and a context window that is missing or smaller than the registry's (Codex compacts on the registry's arithmetic, so a smaller window fails every turn with a pre-stream 400).
+
+### Stickiness and the drain window
+
+A conversation that received source output is **pinned** to the source and stays there (7-day idle limit; compaction is unavailable on the source). Turning overflow **off** stops fresh overflow immediately and arms a drain deadline: conversations already on the source keep working for at most 7 more days, then expire. While that is running the dashboard shows the date by which every pinned conversation has expired (`subscriptionOverflowPinsExpireBy`, the switch-off time plus 7 days) — not the drain deadline itself (`subscriptionOverflowDrainUntil`, the switch-off time plus 29 days), which additionally spans the 21-day tombstone grace during which an expired conversation is still recognised as pinned and handled like one on a disabled source instead of being treated as new. Designating a source again clears both.
+
+### Kill switches
+
+| Action | Effect |
+|---|---|
+| Set the control to **Off** | No new overflow; pinned conversations drain for ≤ 7 days. |
+| Disable the source (or the model on it) | Immediate. Reasoning-bearing pinned conversations end with an error; the others return to subscription accounts. |
+| Delete the source | Clears the designation and arms the drain window in the same transaction; pinned conversations behave as for a disabled source. |
+
+### Client behaviour
+
+- WebSocket sessions cannot be served by a source. A pinned conversation arriving over WebSocket is answered with HTTP `426`, which makes Codex switch **that session** to HTTP until restart.
+- Codex retry semantics for answers on this path: `429` is not retried (`retry_429: false`) and surfaces as "exceeded retry limit, last status: 429" — a source's own rate limit is therefore visible only as that message; `5xx` is retried (`retry_5xx: true`) through the usual reconnect ladder; `400 invalid_request_error` is rendered immediately.
+- `/status` shows the subscription pool, not the source. Forked conversations may replay reasoning the source cannot read. While overflow is on, routing depends on the proxy database being reachable.
+- Limited API keys stream live and are charged an estimate when the source omits usage or the client disconnects mid-answer; fast mode is served at standard tier on the source.
+
+### Note on the bridge's usage-limit answer
+
+Since the WP-E fix in #2124 the HTTP Responses session bridge returns the pool's `429 usage_limit_reached` immediately instead of waiting out the capacity window, so a client sees the same exhaustion answer on both the direct and the bridged path — the answer overflow later replaces.
+
 ---
 
-*Specs: [account-routing](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/account-routing) · [frontend-architecture](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/frontend-architecture) · [usage-refresh-policy](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/usage-refresh-policy)*
+*Specs: [account-routing](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/account-routing) · [frontend-architecture](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/frontend-architecture) · [model-source-routing](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/model-source-routing) · [usage-refresh-policy](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/usage-refresh-policy)*
+
+## HTTP to WebSocket promotion
+
+Owning spec: [Responses API compatibility](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/responses-api-compat).
+
+With automatic upstream transport and the default `smart` HTTP policy, Responses
+and subscription-backed Chat Completions can reuse upstream WebSocket connections
+when requests carry response/cache/session identifiers, a `conversation`, tool
+results, or an assistant response followed by new user input. A first request
+containing only a user message remains HTTP. Native Codex HTTP callers follow
+this policy too; their User-Agent alone does not indicate a WebSocket failure.
+
+Real recent upstream WS failures temporarily keep requests on HTTP (the existing
+60-second cooldown). Explicit HTTP policy, image-capable requests and oversized
+payloads also bypass the bridge. Source-routed Chat requests keep their source.
+
+Clients resending full history need not retain response headers to reuse a
+connection. Inferred locality uses complete initial user input and instructions,
+scoped to the API key. It remains a connection preference: the full history is
+preserved, and an inferred key never authorizes response-anchor injection.
+
+The dashboard's HTTP badge describes client-to-LB transport; the upstream field
+shows the LB-to-provider transport. `codex_lb_http_bridge_routing_total` separates
+`admission` from `bypass` with bounded reasons such as `smart_history`,
+`smart_tool_result`, `smart_single_turn`, `recent_ws_failure`, `payload_size` and
+`image`. Structured `http_bridge_routing` logs include the request ID.
+`codex_lb_http_bridge_connections_total{event="reuse"}` measures actual connection
+reuse; admission counts are not successful-connection counts. Existing TTFT and
+queue latency metrics should be compared alongside reuse when measuring benefits.
