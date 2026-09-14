@@ -3734,8 +3734,9 @@ async def test_v1_responses_normalizes_tool_messages(async_client, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("terminal_includes_output", [False, True])
+@pytest.mark.parametrize("unknown_output", [False, True])
 async def test_public_responses_preserves_tool_search_output(
-    async_client, monkeypatch, stream: bool, terminal_includes_output: bool
+    async_client, monkeypatch, stream: bool, terminal_includes_output: bool, unknown_output: bool
 ):
     auth_json = _make_auth_json("acc_tool_search_output", "tool-search@example.com")
     response = await async_client.post(
@@ -3782,7 +3783,7 @@ async def test_public_responses_preserves_tool_search_output(
     ]
     # This recognized item must not make arbitrary unknown output types pass through.
     unknown_item = {"type": "unknown_result", "id": "unknown_item", "payload": {"value": "opaque"}}
-    upstream_items = [*items, unknown_item]
+    upstream_items = [*items, unknown_item] if unknown_output else items
 
     async def fake_stream(payload, headers, access_token, account_id, **kwargs):
         del payload, headers, access_token, account_id, kwargs
@@ -3820,6 +3821,12 @@ async def test_public_responses_preserves_tool_search_output(
     response = await async_client.post(
         "/v1/responses", json={"model": "gpt-5.4", "instructions": "", "input": "Discover the tool.", "stream": stream}
     )
+    if unknown_output and not stream and not terminal_includes_output:
+        # Missing terminal output requires complete, representable done snapshots.
+        # Dropping an unknown item here would falsely report a partial success.
+        assert response.status_code == 502
+        assert response.json()["error"]["code"] == "invalid_output_item"
+        return
     assert response.status_code == 200
     if stream:
         events = [
