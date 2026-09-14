@@ -8543,7 +8543,7 @@ async def test_stream_responses_honors_timeout_overrides(monkeypatch):
 
     seen: dict[str, object] = {}
 
-    async def fake_iter(resp, idle_timeout_seconds, max_event_bytes):
+    async def fake_iter(resp, idle_timeout_seconds, max_event_bytes, *, progress=None):
         seen["idle_timeout_seconds"] = idle_timeout_seconds
         seen["max_event_bytes"] = max_event_bytes
         yield 'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n'
@@ -8668,10 +8668,15 @@ async def test_stream_responses_prefers_idle_timeout_when_total_deadline_ties_af
         trace_channels = frozenset()
         proxy_request_budget_seconds = 600.0
 
-    monotonic_values = iter([100.0, 100.0, 100.0, 100.0, 700.01])
+    clock = {"now": 100.0}
+
+    async def expire_body_read(self):
+        clock["now"] = 700.01
+        raise asyncio.TimeoutError
 
     monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
-    monkeypatch.setattr(proxy_module.time, "monotonic", lambda: next(monotonic_values, 700.01))
+    monkeypatch.setattr(proxy_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(_TimeoutChunkIterator, "__anext__", expire_body_read)
     monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
     monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
 

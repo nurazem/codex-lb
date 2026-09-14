@@ -8,6 +8,8 @@ from typing import TypeVar
 
 from starlette.requests import Request
 
+from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
+
 _T = TypeVar("_T")
 
 
@@ -36,13 +38,8 @@ async def collect_until_disconnect(request: Request, operation: Awaitable[_T]) -
             if not task.done():
                 task.cancel()
         joined = asyncio.gather(collection, watcher, return_exceptions=True)
-        interrupted: asyncio.CancelledError | None = None
-        while not joined.done():
-            try:
-                await asyncio.shield(joined)
-            except asyncio.CancelledError as exc:
-                # The service already owns bounded persistence/stream cleanup.
-                # Repeated caller cancellation must not cancel that owner again.
-                interrupted = exc
+        # Preserve the existing cleanup owner through edge and ASGI level
+        # cancellation without repeated shield callbacks or a busy loop.
+        interrupted = await _await_cleanup_deferring_cancellation(joined)
         if interrupted is not None:
             raise interrupted

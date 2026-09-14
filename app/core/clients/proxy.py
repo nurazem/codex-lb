@@ -63,6 +63,7 @@ from app.core.clients.native_egress import (
 )
 from app.core.clients.stream_errors import StreamEventTooLargeError, StreamIdleTimeoutError
 from app.core.config.dashboard_overrides import with_dashboard_overrides
+from app.core.clients.upstream_progress import HttpUpstreamProgress
 from app.core.config.settings import Settings, get_settings
 from app.core.conversation_archive import archive_json, archive_text
 from app.core.errors import (
@@ -1442,6 +1443,8 @@ async def _iter_sse_events(
     resp: SSEResponse,
     idle_timeout_seconds: float,
     max_event_bytes: int,
+    *,
+    progress: HttpUpstreamProgress | None = None,
 ) -> AsyncGenerator[str, None]:
     if isinstance(resp, NativeEgressResponse) and resp.sse_framed:
         # Rust owns byte framing and upstream activity deadlines for this
@@ -1490,6 +1493,9 @@ async def _iter_sse_events(
 
         if not chunk:
             continue
+
+        if progress is not None:
+            progress.body_chunk(len(chunk))
 
         buffer.extend(chunk)
         if swallow_lf:
@@ -3795,20 +3801,40 @@ async def _stream_responses_with_session(
         current_headers: Mapping[str, str],
         current_timeout: aiohttp.ClientTimeout,
     ) -> AsyncGenerator[str, None]:
+        progress = HttpUpstreamProgress(body_format="json" if non_streaming_http else "sse")
+        progress.emit("start")
+        exit_kind = "returned"
         try:
-            async with contextlib.aclosing(_stream_via_http_attempt(current_headers, current_timeout)) as attempt:
+            async with contextlib.aclosing(
+                _stream_via_http_attempt(current_headers, current_timeout, progress)
+            ) as attempt:
                 async for event_block in attempt:
                     yield event_block
         except aiohttp.SocketTimeoutError as exc:
+            exit_kind = "timeout"
             # A socket read timeout means the connection was established and
             # then produced nothing. That is an idle stream, not a transport
             # failure, so it joins the idle-timeout path instead of being
             # reported as an unavailable upstream.
             raise StreamIdleTimeoutError() from exc
+        except BaseException as exc:
+            exit_kind = (
+                "cancelled"
+                if isinstance(exc, asyncio.CancelledError)
+                else "closed"
+                if isinstance(exc, GeneratorExit)
+                else "timeout"
+                if isinstance(exc, (TimeoutError, StreamIdleTimeoutError))
+                else "error"
+            )
+            raise
+        finally:
+            progress.emit("exit", exit_kind=exit_kind)
 
     async def _stream_via_http_attempt(
         current_headers: Mapping[str, str],
         current_timeout: aiohttp.ClientTimeout,
+        progress: HttpUpstreamProgress,
     ) -> AsyncGenerator[str, None]:
         nonlocal status_code, last_stream_activity_at, error_code, error_message, seen_terminal
 
@@ -3844,6 +3870,7 @@ async def _stream_responses_with_session(
                 # raw-content adapter is only needed for Python transports.
                 resp = raw_resp if isinstance(raw_resp, NativeEgressResponse) else _CodexSSEResponse(raw_resp)
                 status_code = resp.status
+                progress.headers(status_code)
                 last_stream_activity_at = time.monotonic()
                 # Error responses (429/403) carry the saturated-window
                 # snapshot — exactly when freshness matters most — so headers
@@ -3898,6 +3925,7 @@ async def _stream_responses_with_session(
                     response_payload = await resp.json(content_type=None)
                     event_block, normalized_event_type = _non_streaming_response_event(response_payload)
                     seen_terminal = True
+                    progress.event(terminal=True)
                     archive_json(
                         direction="server_to_codex",
                         kind="responses",
@@ -3918,6 +3946,7 @@ async def _stream_responses_with_session(
                         cast(SSEResponse, resp),
                         effective_idle_timeout,
                         MAX_SSE_EVENT_BYTES,
+                        progress=progress,
                     )
                 ) as routed_events:
                     async for event_block in routed_events:
@@ -3932,6 +3961,8 @@ async def _stream_responses_with_session(
                             or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                         ):
                             seen_terminal = True
+                        if isinstance(normalized_event_type, str):
+                            progress.event(terminal=seen_terminal)
                         archive_text(
                             direction="server_to_codex",
                             kind="responses",
@@ -4005,6 +4036,7 @@ async def _stream_responses_with_session(
             account_id=account_id,
         ) as resp:
             status_code = resp.status
+            progress.headers(status_code)
             last_stream_activity_at = time.monotonic()
             if not suppress_live_usage:
                 publish_live_usage(
@@ -4056,6 +4088,7 @@ async def _stream_responses_with_session(
                 response_payload = cast(JsonValue, await resp.json(content_type=None))
                 event_block, normalized_event_type = _non_streaming_response_event(response_payload)
                 seen_terminal = True
+                progress.event(terminal=True)
                 archive_json(
                     direction="server_to_codex",
                     kind="responses",
@@ -4076,6 +4109,7 @@ async def _stream_responses_with_session(
                     resp,
                     effective_idle_timeout,
                     MAX_SSE_EVENT_BYTES,
+                    progress=progress,
                 )
             ) as direct_events:
                 async for event_block in direct_events:
@@ -4090,6 +4124,8 @@ async def _stream_responses_with_session(
                         or (normalized_event_type == "error" and not enforce_openai_sdk_contract)
                     ):
                         seen_terminal = True
+                    if isinstance(normalized_event_type, str):
+                        progress.event(terminal=seen_terminal)
                     archive_text(
                         direction="server_to_codex",
                         kind="responses",
