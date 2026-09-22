@@ -69,6 +69,7 @@ from app.modules.proxy._load_balancer.error_rate import (
     error_rate_weight_multiplier,
     record_outcome_locked,
 )
+from app.modules.proxy._load_balancer.latency_cohort import apply_latency_cohort_weights
 from app.modules.proxy._load_balancer.model_eligibility import (
     _ADDITIONAL_QUOTA_EXEMPT_PLAN_TYPES,
     CatalogOmissionQuotaAdmission,
@@ -104,6 +105,7 @@ from app.modules.proxy._load_balancer.sticky_selection import (
     StickySelectionRequest,
     _clone_account,
     _StickySelectionOutcome,
+    prepare_selection_states,
     run_sticky_selection_path,
 )
 from app.modules.proxy._load_balancer.sticky_selection import (
@@ -115,9 +117,7 @@ from app.modules.proxy._load_balancer.sticky_selection import (
 from app.modules.proxy._load_balancer.sticky_selection import (
     _filter_recovery_probe_candidates as _filter_recovery_probe_candidates,
 )
-from app.modules.proxy._load_balancer.sticky_selection import (
-    _persist_sticky_mutation as _persist_sticky_mutation,
-)
+from app.modules.proxy._load_balancer.sticky_selection import _persist_sticky_mutation as _persist_sticky_mutation
 from app.modules.proxy._load_balancer.sticky_selection import (
     _probing_result_requires_recovery_reservation as _probing_result_requires_recovery_reservation,
 )
@@ -127,9 +127,7 @@ from app.modules.proxy._load_balancer.sticky_selection import (
 from app.modules.proxy._load_balancer.sticky_selection import (
     _select_account_preferring_budget_safe as _select_account_preferring_budget_safe,
 )
-from app.modules.proxy._load_balancer.sticky_selection import (
-    _select_with_stickiness as _run_select_with_stickiness,
-)
+from app.modules.proxy._load_balancer.sticky_selection import _select_with_stickiness as _run_select_with_stickiness
 from app.modules.proxy._load_balancer.sticky_selection import (
     _state_above_budget_threshold as _state_above_budget_threshold,
 )
@@ -223,6 +221,10 @@ class AccountSelection:
     lease: AccountLease | None = None
     catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
     continuity_owner_no_longer_exists: bool = False
+    # ``hard_affinity_saturated`` whose resolved owner is one of the caller's
+    # own ``exclude_account_ids``: the wait a transient owner outage earns
+    # cannot clear this one (``_hard_affinity_owner_excluded_by_caller``).
+    hard_affinity_owner_excluded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +618,7 @@ class LoadBalancer:
 
         excluded_ids = set(exclude_account_ids or ())
         scoped_account_ids = None if account_ids is None else set(account_ids)
+        hard_affinity_owner_excluded = False
         owner_restricted_selection = required_account_is_ownership_constraint or required_continuity_owner
         sticky_selection_may_resolve_owner = sticky_key is not None and sticky_kind == StickySessionKind.CODEX_SESSION
         # C2-3 resilience toggles: resolved from the caller's dashboard snapshot
@@ -894,6 +897,7 @@ class LoadBalancer:
                     routing_tunables=tunables,
                     api_key_id=api_key_id,
                     api_key_stream_fair_share_threshold_pct=api_key_stream_fair_share_threshold_pct,
+                    model=model,
                     selection_inputs=selection_inputs,
                     reload_inputs=load_selection_inputs,
                     record_account_cap_rejection=_record_account_cap_rejection,
@@ -969,6 +973,8 @@ class LoadBalancer:
                     redact_sensitive_details=redact_sensitive_details,
                     api_key_id=api_key_id,
                     api_key_stream_fair_share_threshold_pct=api_key_stream_fair_share_threshold_pct,
+                    exclude_account_ids=frozenset(excluded_ids),
+                    model=model,
                     selection_inputs=selection_inputs,
                     reload_inputs=load_selection_inputs,
                     record_account_cap_rejection=_record_account_cap_rejection,
@@ -982,6 +988,7 @@ class LoadBalancer:
             error_message = sticky_outcome.error_message
             selection_error_code = sticky_outcome.error_code
             selection_resets_at = sticky_outcome.resets_at
+            hard_affinity_owner_excluded = sticky_outcome.hard_affinity_owner_excluded
             if sticky_outcome.disposition == "direct_error":
                 return AccountSelection(
                     account=None,
@@ -1033,6 +1040,7 @@ class LoadBalancer:
                 error_message=error_message,
                 error_code=selection_error_code,
                 resets_at=selection_resets_at,
+                hard_affinity_owner_excluded=hard_affinity_owner_excluded,
             )
         if not circuit_breaker_open:
             set_normal()
@@ -1615,36 +1623,17 @@ class LoadBalancer:
         redact_sensitive_details: bool,
         routing_tunables: RoutingTunables,
         soft_drain_enabled: bool | None = None,
+        model: str | None = None,
     ) -> tuple[list[AccountState], dict[str, Account]]:
-        self._reclaim_stale_account_leases_locked(
-            routing_tunables=routing_tunables,
+        return prepare_selection_states(
+            self,
+            selection_inputs,
+            build_states=_build_states,
+            required_account_id=required_account_id,
             redact_sensitive_details=redact_sensitive_details,
-        )
-        self._prune_runtime(selection_inputs.runtime_accounts or selection_inputs.accounts)
-        states, account_map = _build_states(
-            accounts=selection_inputs.accounts,
-            latest_primary=selection_inputs.latest_primary,
-            latest_secondary=selection_inputs.latest_secondary,
-            latest_monthly=selection_inputs.latest_monthly,
-            runtime=self._runtime,
-            now=self._clock.time(),
-            routing_policy_override=selection_inputs.routing_policy_override,
-            ignore_standard_quota_account_ids=selection_inputs.ignore_standard_quota_account_ids,
-            encryptor=self._encryptor,
             routing_tunables=routing_tunables,
-            # C2-3 resilience toggles: an explicit value (opportunistic admission)
-            # wins; selection carries it on its inputs.
-            soft_drain_enabled=(
-                soft_drain_enabled
-                if soft_drain_enabled is not None
-                else getattr(selection_inputs, "soft_drain_enabled", None)
-            ),
-        )
-        if required_account_id is None:
-            return states, account_map
-        return (
-            [state for state in states if state.account_id == required_account_id],
-            {account_id: account for account_id, account in account_map.items() if account_id == required_account_id},
+            soft_drain_enabled=soft_drain_enabled,
+            model=model,
         )
 
     async def _get_account_lock(self, account_id: str) -> asyncio.Lock:
@@ -1679,11 +1668,13 @@ class LoadBalancer:
         sticky_existing_account_id: str | None | object = _STICKY_EXISTING_UNSET,
         initial_preferred_account_id: str | None = None,
         preserve_existing_mapping_on_fallback: bool = False,
+        preserve_reason_request_local: bool = False,
         traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
         ignore_standard_quota: bool = False,
         allow_usage_exhaustion_error: bool = True,
         usage_exhaustion_states: Iterable[AccountState] | None = None,
         sticky_refresh_skip_deadline: datetime | None = None,
+        redact_sensitive_details: bool = False,
     ) -> _StickySelectionOutcome:
         return await _run_select_with_stickiness(
             states=states,
@@ -1704,6 +1695,7 @@ class LoadBalancer:
             sticky_existing_account_id=sticky_existing_account_id,
             initial_preferred_account_id=initial_preferred_account_id,
             preserve_existing_mapping_on_fallback=preserve_existing_mapping_on_fallback,
+            preserve_reason_request_local=preserve_reason_request_local,
             traffic_class=traffic_class,
             ignore_standard_quota=ignore_standard_quota,
             allow_usage_exhaustion_error=allow_usage_exhaustion_error,
@@ -1711,6 +1703,7 @@ class LoadBalancer:
             sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
             overload_backoff_runtime=self._runtime,
             clock=self._clock,
+            redact_sensitive_details=redact_sensitive_details,
         )
 
     _persist_sticky_mutation = staticmethod(_persist_sticky_mutation)
@@ -2112,6 +2105,8 @@ def _build_states(
     encryptor: TokenEncryptor | None = None,
     routing_tunables: RoutingTunables | None = None,
     soft_drain_enabled: bool | None = None,
+    model: str | None = None,
+    log_weight_transitions: bool = True,
 ) -> tuple[list[AccountState], dict[str, Account]]:
     now = REAL_CLOCK.time() if now is None else now
     # Request and background callers pass their snapshot's values; None (tests, tools) = environment layer.
@@ -2146,6 +2141,7 @@ def _build_states(
         state.ignore_standard_quota = account.id in ignore_standard_quota_account_ids
         states.append(state)
         account_map[account.id] = account
+    apply_latency_cohort_weights(states, runtime, now=now, model=model, log_transitions=log_weight_transitions)
     return states, account_map
 
 

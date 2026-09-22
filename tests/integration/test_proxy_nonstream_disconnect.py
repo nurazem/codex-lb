@@ -151,6 +151,16 @@ async def test_nonstream_mixed_requests_release_configured_account_capacity(asyn
     from collections import Counter
 
     import app.modules.proxy.load_balancer as balancer_module
+    from app.modules.proxy._service.streaming import retry as retry_module
+
+    # Upstream now waits for local capacity instead of returning immediately.
+    # Keep that path but compress its deliberate wall-clock backoff in this test.
+    recovery_sleep = retry_module._account_selection_recovery_sleep_seconds
+    monkeypatch.setattr(
+        retry_module,
+        "_account_selection_recovery_sleep_seconds",
+        lambda selection: 0.01 if recovery_sleep(selection) is not None else None,
+    )
     from app.core.config.settings import Settings
 
     account_id = "acc_nonstream_mixed"

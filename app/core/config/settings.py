@@ -16,6 +16,11 @@ from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.core.auth.dashboard_mode import DashboardAuthMode, normalize_dashboard_auth_proxy_header
+from app.core.clients.codex_version_snapshot import CODEX_VERSION
+from app.core.clients.thread_cache_identity import (
+    THREAD_CACHE_IDENTITY_MODE_DEFAULT,
+    normalize_thread_cache_identity_mode,
+)
 from app.core.utils.proxy_env import outbound_proxy_env_configured
 
 logger = logging.getLogger(__name__)
@@ -118,6 +123,17 @@ _REMOVED_SETTINGS: tuple[str, ...] = (
     "CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_CLEAN_CLOSE_RETRY_JITTER_MAX_SECONDS",
     "CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_OPERATION_LEDGER_ENABLED",
     # end K2 bridge
+    # drop-bridge-recovery-modes (first release after v1.25.0-beta.7): the
+    # three non-default ambiguous-continuation recovery modes were deleted and
+    # the shipped ``fail_closed`` behaviour is now the only one.
+    "CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE",
+    # constantize-token-refresh-interval (first release after v1.25.0-beta.7):
+    # the proactive refresh window is the fixed eight-day
+    # ``TOKEN_REFRESH_INTERVAL_DAYS`` in ``app/core/auth/refresh.py``. Its only
+    # live consumer, the traffic-parity canary, now suppresses proactive
+    # refresh by stamping its isolated ``auth.json`` inside the window instead
+    # of widening the window for the whole process.
+    "CODEX_LB_TOKEN_REFRESH_INTERVAL_DAYS",
 )
 
 
@@ -307,6 +323,7 @@ class Settings(BaseSettings):
     upstream_websocket_trust_env: bool = Field(default_factory=_default_upstream_websocket_trust_env)
     # T3 → dashboard (deprecated env alias, remove next minor)
     proxy_request_budget_seconds: float = Field(default=600.0, gt=0)
+    # T3 → dashboard (deprecated env alias, remove next minor)
     http_responses_stream_request_budget_seconds: float = Field(default=7200.0, gt=0)
     # T3 → dashboard (deprecated env alias, remove next minor)
     compact_request_budget_seconds: float = Field(default=180.0, gt=0)
@@ -317,19 +334,23 @@ class Settings(BaseSettings):
     # T3 → dashboard (deprecated env alias, remove next minor)
     proxy_downstream_websocket_idle_timeout_seconds: float = Field(default=120.0, gt=0)
     oauth_callback_host: str = _default_oauth_callback_host()
+    # T3 → dashboard (deprecated env alias, remove next minor)
     auth_guardian_enabled: bool = True
     # T3 → dashboard (deprecated env alias, remove next minor)
     transcription_request_budget_seconds: float = Field(default=120.0, gt=0)
-    token_refresh_interval_days: int = 8
     # T1 (topology). Path to a JSON registry of additional usage quota keys
     # that replaces the bundled ``config/additional_quota_registry.json``.
     # Unset (or blank) keeps the bundled registry. The Alembic backfill
     # migration ``20260312_000000`` reads the same env name directly because
     # migrations must not depend on ``Settings``.
     additional_quota_registry_file: Path | None = None
+    # T3 → dashboard (deprecated env alias, remove next minor)
     rate_limit_reset_credits_refresh_enabled: bool = True
     http_responses_session_bridge_enabled: bool = True
+    # T3 → dashboard (deprecated env alias, remove next minor)
     http_responses_session_bridge_request_budget_seconds: float = Field(default=7200.0, gt=0)
+    # T3 → dashboard (deprecated env alias, remove next minor): the same-name
+    # ``dashboard_settings`` column wins when set (M3 codex prewarm).
     http_responses_session_bridge_codex_prewarm_enabled: bool = False
     http_responses_session_bridge_max_sessions: int = Field(default=256, gt=0)
     http_responses_session_bridge_queue_limit: int = Field(default=8, gt=0)
@@ -352,19 +373,11 @@ class Settings(BaseSettings):
     )
     # Keep durable transcript material short-lived by default. The transcript
     # is sensitive prompt/output data and is only a recovery aid.
+    # T3 → dashboard (deprecated env alias, remove next minor)
     http_responses_session_bridge_operation_spool_retention_seconds: float = Field(
         default=7 * 24 * 60 * 60,
         gt=0,
     )
-    # Recovery-first mode can either ask the client to drop an ambiguous anchor
-    # or let the bridge retry that anchored request once on a fresh upstream
-    # socket. Both are at-least-once strategies; fail-closed remains default.
-    http_responses_session_bridge_ambiguous_continuation_recovery_mode: Literal[
-        "fail_closed",
-        "client_full_history_once",
-        "server_anchored_replay_once",
-        "server_indefinite_recovery",
-    ] = "fail_closed"
     http_responses_session_bridge_instance_id: str = Field(default_factory=_default_http_bridge_instance_id)
     http_responses_session_bridge_instance_ring: Annotated[list[str], NoDecode] = Field(default_factory=list)
     http_responses_session_bridge_advertise_base_url: str | None = None
@@ -372,6 +385,7 @@ class Settings(BaseSettings):
     # disables caching. Admin mutations invalidate durably through the
     # cache-invalidation bus, so this only bounds out-of-band database edits.
     upstream_route_cache_ttl_seconds: float = Field(default=60.0, ge=0)
+    # T3 → dashboard (deprecated env alias, remove next minor)
     automations_scheduler_enabled: bool = True
     # T3 (dashboard home: dashboard_settings.telemetry_consent). Headless
     # first-boot opt-out fallback; a persisted dashboard decision always wins.
@@ -391,6 +405,9 @@ class Settings(BaseSettings):
     # (upstream request summary/completion), ``upstream_payload`` (upstream
     # request payload). Interactive incident use only, not steady-state config.
     trace: str = ""
+    # T3 → dashboard (deprecated env alias, remove next minor): the
+    # ``dashboard_settings.conversation_archive_enabled`` column wins when set;
+    # the archive writer resolves it from the settings-cache snapshot.
     conversation_archive_enabled: bool = False
     conversation_archive_dir: Path = DEFAULT_CONVERSATION_ARCHIVE_DIR
     conversation_archive_queue_max_bytes: int = Field(default=256 * 1024 * 1024, gt=0)
@@ -406,10 +423,13 @@ class Settings(BaseSettings):
     # Must stay >= the highest ``minimal_client_version`` in the bootstrap
     # catalog (GPT-5.6 requires 0.144.0) or a degraded-startup refresh would
     # receive an upstream catalog without those models.
-    model_registry_client_version: str = "0.153.4"
+    model_registry_client_version: str = CODEX_VERSION
     # Persisted registry snapshots older than this are ignored at load time
     # (bootstrap catalog remains the floor until the next leader refresh).
     model_registry_snapshot_max_age_seconds: int = Field(default=86400, gt=0)
+    # T3 → dashboard (deprecated env alias, remove next minor). Per-slug fallback:
+    # a ``model_context_window_overrides`` dashboard row wins for its slug; slugs
+    # without a row still read this dict.
     model_context_window_overrides: Annotated[dict[str, int], NoDecode] = Field(default_factory=dict)
     # T1 (topology). Raw socket-peer CIDRs allowed to call the proxy without an
     # API key: a fact of this replica's network namespace (sidecar, pod CIDR),
@@ -443,6 +463,11 @@ class Settings(BaseSettings):
         return _effective_environ()
 
     dashboard_auth_proxy_header: str = "Remote-User"
+    # T1 (topology). The header the reverse proxy puts the caller's groups in;
+    # it must match that proxy's configuration, so it cannot live in the
+    # dashboard (policy D2). Optional: an install whose proxy sends no such
+    # header simply has no groups and matches no group rule.
+    dashboard_auth_proxy_groups_header: str = "Remote-Groups"
 
     # --- Multi-replica & production settings ---
     # Prometheus metrics
@@ -468,6 +493,12 @@ class Settings(BaseSettings):
     # ``dashboard_settings`` columns win when set.
     soft_drain_enabled: bool = True
     deterministic_failover_enabled: bool = True
+
+    # Thread cache identity mode: "shared" (default) or "isolated".
+    # T3 -> dashboard: the same-name nullable ``dashboard_settings`` column
+    # wins when it is non-NULL; this field is the environment fallback only.
+    # ``shared`` is byte-for-byte the pre-existing outbound request.
+    thread_cache_identity_mode: str = THREAD_CACHE_IDENTITY_MODE_DEFAULT
 
     # Backpressure
     backpressure_max_concurrent_requests: int = 0  # 0 = unlimited
@@ -552,6 +583,29 @@ class Settings(BaseSettings):
             return Path(stripped).expanduser()
         raise TypeError("data_dir must be a path")
 
+    @field_validator("thread_cache_identity_mode", mode="before")
+    @classmethod
+    def _normalize_thread_cache_identity_mode(cls, value: object) -> str:
+        """Coerce an unrecognised value to ``shared`` instead of letting it escape.
+
+        The settings API constrains this field to ``shared``/``isolated``, so a
+        typo in the environment variable would otherwise reach the response
+        model and fail ``GET /api/settings`` for every setting at once. A
+        behaviour toggle is also the wrong thing to make a boot failure, so the
+        unrecognised value degrades to the safe default and says so.
+        """
+        if value is None:
+            return THREAD_CACHE_IDENTITY_MODE_DEFAULT
+        normalized = normalize_thread_cache_identity_mode(value)
+        if normalized is not None:
+            return normalized
+        logger.warning(
+            "CODEX_LB_THREAD_CACHE_IDENTITY_MODE=%r is not a known mode; using %r",
+            value,
+            THREAD_CACHE_IDENTITY_MODE_DEFAULT,
+        )
+        return THREAD_CACHE_IDENTITY_MODE_DEFAULT
+
     @field_validator("database_url")
     @classmethod
     def _expand_database_url(cls, value: str) -> str:
@@ -612,6 +666,13 @@ class Settings(BaseSettings):
         if not isinstance(value, str):
             raise TypeError("dashboard_auth_proxy_header must be a string")
         return normalize_dashboard_auth_proxy_header(value)
+
+    @field_validator("dashboard_auth_proxy_groups_header", mode="before")
+    @classmethod
+    def _normalize_dashboard_auth_proxy_groups_header(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise TypeError("dashboard_auth_proxy_groups_header must be a string")
+        return normalize_dashboard_auth_proxy_header(value, "dashboard_auth_proxy_groups_header")
 
     @field_validator("http_responses_session_bridge_instance_ring", mode="before")
     @classmethod
@@ -724,6 +785,17 @@ class Settings(BaseSettings):
             return self
         if not self.firewall_trust_proxy_headers:
             raise ValueError("dashboard_auth_mode=trusted_header requires firewall_trust_proxy_headers=true")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_dashboard_auth_proxy_headers_differ(self) -> "Settings":
+        # One header cannot be both the identity and the group claim: that
+        # would turn the username into a group and hand out roles by name.
+        if self.dashboard_auth_proxy_groups_header.lower() == self.dashboard_auth_proxy_header.lower():
+            raise ValueError(
+                "dashboard_auth_proxy_groups_header must not equal dashboard_auth_proxy_header "
+                f"('{self.dashboard_auth_proxy_header}')"
+            )
         return self
 
     @model_validator(mode="after")

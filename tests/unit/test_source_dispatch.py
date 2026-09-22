@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Coroutine
 from contextlib import AsyncExitStack
@@ -36,7 +35,6 @@ from app.modules.model_sources.forwarding import (
     SourceUsageHolder,
 )
 from app.modules.proxy import source_dispatch as dispatch_module
-from app.modules.proxy.model_source_pins import PinIntent, PinWrite
 from app.modules.proxy.source_admission import SourceAdmission, SourceBulkhead
 from app.modules.proxy.source_dispatch import (
     ABANDON_CLIENT_DISCONNECTED_BEFORE_BODY,
@@ -47,12 +45,10 @@ from app.modules.proxy.source_dispatch import (
     ClientDisconnectedDuringOpen,
     SourceChatStreamOwner,
     SourceDispatch,
-    SourcePinCommitError,
     SourceStreamingResponse,
     estimate_settlement_usage,
     open_with_disconnect_watch,
     settlement_stream,
-    synthesized_pin_failure_frames,
 )
 from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 
@@ -598,15 +594,13 @@ async def test_row_carries_source_attribution_fields(recorder: _Recorder) -> Non
 
 
 @pytest.mark.asyncio
-async def test_row_falls_back_to_the_proxy_request_id_and_honours_the_overflow_attribution(
-    recorder: _Recorder,
-) -> None:
-    owner = _owner(recorder, reservation=None, request_log_source="other_source", dispatch_kind="other")
+async def test_row_falls_back_to_the_proxy_request_id(recorder: _Recorder) -> None:
+    owner = _owner(recorder, reservation=None)
     await owner.finish(status="cancelled", error_code="client_disconnected")
     row = recorder.rows[0]
     assert row["request_id"] == "req-proxy-1"
     assert row["archive_request_id"] == "req-proxy-1"
-    assert row["source"] == "other_source"
+    assert row["source"] == "model_source"
 
 
 @pytest.mark.asyncio
@@ -1566,127 +1560,6 @@ async def test_settlement_stream_unexpected_exception_is_a_stream_error(recorder
     assert recorder.rows[0]["error_code"] == "model_source_stream_error"
     assert recorder.rows[0]["error_message"] == "ValueError"
     assert recorder.release_calls == [owner.reservation]
-
-
-# -- pin hook and synthesized pair ------------------------------------------------------------------
-
-
-class _FakeExecutor:
-    def __init__(self, outcome: str) -> None:
-        self.outcome = outcome
-        self.calls = 0
-
-    async def commit(self, intent: PinIntent, *, drain_until: object, scheduler: object, clock: object) -> str:
-        self.calls += 1
-        return self.outcome
-
-
-def _intent() -> PinIntent:
-    return PinIntent(
-        writes=(PinWrite(pin_key="thread\nabc", kind="thread", source_id="src", api_key_id=None),), thread_key="abc"
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("outcome", ["not_written", "unknown"])
-async def test_on_first_content_raises_when_the_pin_did_not_verify(recorder: _Recorder, outcome: str) -> None:
-    executor = _FakeExecutor(outcome)
-    owner = _owner(recorder, pin_intent=_intent(), pin_executor=executor)
-    with pytest.raises(SourcePinCommitError) as excinfo:
-        await owner.on_first_content(SourceUsageHolder())
-    assert excinfo.value.outcome == outcome
-    assert owner.pin_outcome == outcome
-    assert executor.calls == 1
-
-
-@pytest.mark.asyncio
-async def test_on_first_content_written_lets_the_stream_proceed(recorder: _Recorder) -> None:
-    executor = _FakeExecutor("written")
-    owner = _owner(recorder, pin_intent=_intent(), pin_executor=executor)
-    await owner.on_first_content(SourceUsageHolder())
-    assert owner.pin_outcome == "written"
-
-
-@pytest.mark.asyncio
-async def test_on_first_content_without_an_intent_is_a_no_op(recorder: _Recorder) -> None:
-    owner = _owner(recorder)
-    await owner.on_first_content(SourceUsageHolder())
-    assert owner.pin_outcome is None
-
-
-def test_synthesized_pair_shape() -> None:
-    envelope = {"id": "resp_src", "object": "response", "model": "src-model", "created_at": 1}
-    frames = synthesized_pin_failure_frames(envelope, error_code="pin_unavailable")
-    assert len(frames) == 2
-    created = json.loads(frames[0].split("data: ", 1)[1])
-    failed = json.loads(frames[1].split("data: ", 1)[1])
-    assert frames[0].startswith("event: response.created\n")
-    assert frames[1].startswith("event: response.failed\n")
-    assert created["sequence_number"] == 0 and failed["sequence_number"] == 1
-    assert created["response"]["id"] == "resp_src" and failed["response"]["id"] == "resp_src"
-    assert created["response"]["status"] == "in_progress"
-    assert failed["response"]["status"] == "failed"
-    assert failed["response"]["error"]["code"] == "pin_unavailable"
-    assert failed["response"]["error"]["type"] == "server_error"
-    minimal = synthesized_pin_failure_frames(None, error_code="pin_unavailable")
-    assert json.loads(minimal[0].split("data: ", 1)[1])["response"]["object"] == "response"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("outcome", "expected_row_code"), [("not_written", "pin_failed"), ("unknown", "pin_unverified")]
-)
-async def test_settlement_stream_pin_failure_yields_exactly_the_pair_and_releases(
-    recorder: _Recorder, outcome: str, expected_row_code: str
-) -> None:
-    executor = _FakeExecutor(outcome)
-    owner = _owner(
-        recorder,
-        reservation=_reservation(),
-        pin_intent=_intent(),
-        pin_executor=executor,
-        pin_failure_error_code="pin_failed",
-        pin_unverified_error_code="pin_unverified",
-    )
-    holder = SourceUsageHolder(created_envelope={"id": "resp_src", "object": "response"})
-    stream = _attach_stream(owner, holder=holder)
-
-    async def inner() -> AsyncIterator[str]:
-        # The forwarding body withholds non-content frames and awaits the hook at the first content frame.
-        await owner.on_first_content(holder)
-        yield "data: never delivered\n\n"
-
-    chunks = [chunk async for chunk in settlement_stream(owner, inner())]
-
-    assert len(chunks) == 2
-    assert "response.created" in chunks[0] and "response.failed" in chunks[1]
-    assert "never delivered" not in "".join(chunks)
-    assert json.loads(chunks[1].split("data: ", 1)[1])["response"]["error"]["code"] == "pin_failed"
-    assert recorder.release_calls == [owner.reservation]
-    assert recorder.settle_calls == []
-    assert stream.closed == 1
-    assert len(recorder.rows) == 1
-    assert recorder.rows[0]["status"] == "error"
-    assert recorder.rows[0]["error_code"] == expected_row_code
-
-
-@pytest.mark.asyncio
-async def test_settlement_stream_pin_written_flushes_withheld_frames(recorder: _Recorder) -> None:
-    executor = _FakeExecutor("written")
-    owner = _owner(recorder, reservation=_reservation(limited=False), pin_intent=_intent(), pin_executor=executor)
-    holder = SourceUsageHolder(terminal_kind="completed")
-    _attach_stream(owner, holder=holder)
-
-    async def inner() -> AsyncIterator[str]:
-        withheld = ["data: created\n\n", "data: in_progress\n\n"]
-        await owner.on_first_content(holder)
-        for frame in withheld:
-            yield frame
-        yield "data: item\n\n"
-
-    chunks = [chunk async for chunk in settlement_stream(owner, inner())]
-    assert chunks == ["data: created\n\n", "data: in_progress\n\n", "data: item\n\n"]
-    assert recorder.rows[0]["status"] == "success"
 
 
 # -- SourceStreamingResponse transport ------------------------------------------------------------------

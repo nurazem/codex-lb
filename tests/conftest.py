@@ -40,6 +40,8 @@ os.environ["CODEX_LB_UPSTREAM_ROUTE_CACHE_TTL_SECONDS"] = "0"
 from app.db.models import Base  # noqa: E402
 from app.db.session import engine  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.modules.auth_providers.seed import seed_default_auth_providers  # noqa: E402
+from app.modules.dashboard_roles.seed import seed_preset_dashboard_roles  # noqa: E402
 
 
 class _NoopScheduler:
@@ -64,6 +66,7 @@ class _NoopScheduler:
 # themselves (e.g. test_otel, test_telemetry_consent,
 # test_model_registry_replication) and keep working.
 BACKGROUND_LOOP_BUILDERS: tuple[str, ...] = (
+    "build_metadata_refresh_scheduler",
     "build_usage_refresh_scheduler",
     "build_model_refresh_scheduler",
     "build_sticky_session_cleanup_scheduler",
@@ -74,6 +77,7 @@ BACKGROUND_LOOP_BUILDERS: tuple[str, ...] = (
     "build_account_usage_rollup_scheduler",
     "build_data_retention_scheduler",
     "build_telemetry_scheduler",
+    "build_account_deletion_scheduler",
 )
 
 
@@ -128,6 +132,10 @@ def _recreate_test_schema(sync_conn) -> None:
     _drop_test_migration_tables(sync_conn)
     Base.metadata.drop_all(sync_conn)
     Base.metadata.create_all(sync_conn)
+    # Production seeds these through the migration and at startup; the test
+    # schema is built with create_all, so seed the preset role rows here too.
+    seed_preset_dashboard_roles(sync_conn)
+    seed_default_auth_providers(sync_conn)
 
 
 def _reset_test_database(sync_conn) -> None:
@@ -212,6 +220,17 @@ def _disable_account_usage_summary_cache(monkeypatch):
 
     accounts_repository_module._clear_request_usage_summary_cache()
     monkeypatch.setattr(accounts_repository_module, "_SUMMARY_CACHE_TTL_SECONDS", 0.0)
+
+
+@pytest.fixture(autouse=True)
+def _disable_dashboard_trailing_demand_cache(monkeypatch):
+    """Zero the weekly-pace trailing-demand cache TTL so dashboard pace
+    figures stay exact within a test. The TTL is a fixed constant in
+    production; cache-behavior tests patch it back to a positive value."""
+    import app.modules.dashboard.repository as dashboard_repository_module
+
+    dashboard_repository_module._clear_trailing_demand_cache()
+    monkeypatch.setattr(dashboard_repository_module, "_TRAILING_DEMAND_TTL_SECONDS", 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -429,9 +448,13 @@ def _reset_codex_version_cache():
     cache = get_codex_version_cache()
     cache._cached_version = None
     cache._cached_at = 0.0
+    cache._retry_at = 0.0
+    cache._cache_path = None
     yield
     cache._cached_version = None
     cache._cached_at = 0.0
+    cache._retry_at = 0.0
+    cache._cache_path = None
 
 
 def _reset_global_state() -> None:
@@ -467,12 +490,37 @@ def _reset_global_state() -> None:
         settings_cache = get_settings_cache()
         settings_cache._cached_settings = None
         settings_cache._cached_at = 0.0
+        # ``cached_row()`` deliberately survives an invalidation (a dashboard
+        # value must not revert to the environment between a mutation and the
+        # next load), so the fallback slot needs an explicit reset here or a
+        # dashboard row leaks from one test into the next.
+        settings_cache._last_loaded_settings = None
+    except Exception:
+        pass
+    try:
+        from app.core.auth.dashboard_users_cache import get_dashboard_users_cache
+
+        get_dashboard_users_cache().clear()
+    except Exception:
+        pass
+    try:
+        from app.core.auth.providers.registry import get_auth_provider_registry
+        from app.modules.dashboard_users.identity_resolver import get_identity_resolution_cache
+
+        get_auth_provider_registry().clear()
+        get_identity_resolution_cache().clear()
     except Exception:
         pass
     try:
         from app.core.upstream_proxy.cache import get_upstream_route_cache
 
         get_upstream_route_cache().clear()
+    except Exception:
+        pass
+    try:
+        from app.core.config.context_window_overrides import get_model_context_window_overrides_cache
+
+        get_model_context_window_overrides_cache().clear()
     except Exception:
         pass
     try:
@@ -491,6 +539,15 @@ def _reset_global_state() -> None:
         from app.modules.api_keys.last_used_coalescer import get_api_key_last_used_coalescer
 
         get_api_key_last_used_coalescer().clear()
+    except Exception:
+        pass
+    try:
+        # Thread anchors are process-global by design (one live thread keeps
+        # one derived prompt_cache_key), so a body reused by the next test
+        # would otherwise resolve to the previous test's key and account.
+        from app.modules.proxy.thread_anchors import reset_thread_anchor_index
+
+        reset_thread_anchor_index()
     except Exception:
         pass
     try:

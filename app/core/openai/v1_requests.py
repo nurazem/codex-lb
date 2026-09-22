@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.message_coercion import coerce_messages
@@ -30,7 +36,6 @@ def _validate_optional_messages_array(value: list[JsonValue] | None) -> list[Jso
 
 class V1ResponsesRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
-
     model: str = Field(min_length=1)
     messages: PassthroughJsonList | None = None
     input: PassthroughJsonValue = None

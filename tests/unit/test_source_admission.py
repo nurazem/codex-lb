@@ -1,4 +1,4 @@
-"""Per-source bulkhead and admission claims (#2123 WP-C1, design v3 §6, §8.4)."""
+"""Per-source bulkhead and admission claims for model-source dispatch."""
 
 from __future__ import annotations
 
@@ -27,14 +27,6 @@ def _source(source_id: str = "src_bulkhead", max_concurrency: int | None = 1) ->
         supports_responses=True,
         max_concurrency=max_concurrency,
     )
-
-
-class _Trial:
-    def __init__(self) -> None:
-        self.results: list[str] = []
-
-    def settle(self, result: str) -> None:
-        self.results.append(result)
 
 
 def test_bulkhead_enforces_max_concurrency_per_source() -> None:
@@ -83,11 +75,11 @@ def test_try_claim_returns_none_when_saturated_and_claims_release_exactly_once()
     # The route-helper latch is a no-op once an owner holds the claims.
     claims.release_if_unowned()
     assert bulkhead.in_flight(source.id) == 1
-    claims.release("success")
+    claims.release()
     assert bulkhead.in_flight(source.id) == 0
     assert claims.released is True
     # A second release (owner latch re-entered) changes nothing.
-    claims.release("failure")
+    claims.release()
     assert bulkhead.in_flight(source.id) == 0
     assert try_claim(source, bulkhead=bulkhead) is not None
 
@@ -109,31 +101,6 @@ def test_transfer_to_rejects_a_second_owner() -> None:
     claims.transfer_to(first)
     with pytest.raises(RuntimeError):
         claims.transfer_to(object())
-
-
-def test_trial_result_reaches_the_trial_exactly_once() -> None:
-    trial = _Trial()
-    bulkhead = SourceBulkhead()
-    slot = bulkhead.try_acquire("src_trial", None)
-    claims = SourceAdmission(slot=slot, trial=trial, bulkhead=bulkhead)
-    claims.release("failure")
-    claims.release("success")
-    assert trial.results == ["failure"]
-    assert bulkhead.in_flight("src_trial") == 0
-
-
-def test_trial_settle_failure_still_releases_the_slot() -> None:
-    class _Broken:
-        def settle(self, result: str) -> None:
-            raise RuntimeError("breaker unavailable")
-
-    bulkhead = SourceBulkhead()
-    slot = bulkhead.try_acquire("src_trial", 1)
-    claims = SourceAdmission(slot=slot, trial=_Broken(), bulkhead=bulkhead)
-    with pytest.raises(RuntimeError):
-        claims.release("inconclusive")
-    assert bulkhead.in_flight("src_trial") == 0
-    assert claims.released is True
 
 
 def test_get_source_bulkhead_is_a_process_singleton(monkeypatch: pytest.MonkeyPatch) -> None:

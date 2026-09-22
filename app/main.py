@@ -23,7 +23,9 @@ from fastapi.responses import FileResponse
 from starlette.staticfiles import StaticFiles
 
 from app.core.audit.service import drain_audit_log_tasks
+from app.core.auth.dashboard_users_cache import get_dashboard_users_cache
 from app.core.auth.guardian import build_auth_guardian_scheduler
+from app.core.auth.providers.registry import get_auth_provider_registry
 from app.core.balancer import configure_replica_salt
 from app.core.bootstrap import ensure_auto_bootstrap_token, log_bootstrap_token
 from app.core.clients.http import close_http_client, init_http_client
@@ -38,6 +40,10 @@ from app.core.config.settings import (
     warn_removed_settings,
 )
 from app.core.config.settings_cache import get_settings_cache
+from app.core.config.spool_retention import (
+    resolve_operation_spool_retention_seconds,
+    warn_spool_retention_below_floor,
+)
 from app.core.handlers import add_exception_handlers
 from app.core.metrics.middleware import MetricsMiddleware
 from app.core.metrics.prometheus import MULTIPROCESS_MODE, PROMETHEUS_AVAILABLE, make_scrape_registry, mark_process_dead
@@ -46,6 +52,7 @@ from app.core.middleware import (
     add_app_version_middleware,
     add_backend_api_codex_v1_alias_middleware,
     add_dashboard_auth_proxy_middleware,
+    add_dashboard_csrf_middleware,
     add_multipart_content_encoding_middleware,
     add_request_body_limit_middleware,
     add_request_decompression_middleware,
@@ -66,6 +73,7 @@ from app.core.runtime_logging import install_redacting_loop_exception_handler
 from app.core.scheduling.leader_election import get_leader_election
 from app.core.shutdown import close_control_plane_task_admission
 from app.core.timeout_invariants import validate_runtime_timeout_invariants, validate_timeout_invariants
+from app.core.usage.metadata_scheduler import build_metadata_refresh_scheduler
 from app.core.usage.refresh_scheduler import build_usage_refresh_scheduler
 from app.core.usage.reset_credits_refresh_scheduler import build_rate_limit_reset_credits_scheduler
 from app.core.utils.time import utcnow
@@ -85,11 +93,16 @@ from app.modules.api_keys import api as api_keys_api
 from app.modules.api_keys.last_used_coalescer import build_api_key_last_used_flush_scheduler
 from app.modules.api_keys.reset_scheduler import build_api_key_limit_reset_scheduler
 from app.modules.audit import api as audit_api
+from app.modules.auth_providers import api as auth_providers_api
 from app.modules.automations import api as automations_api
 from app.modules.automations.scheduler import build_automations_scheduler
+from app.modules.cache_isolation_probe import api as cache_isolation_probe_api
 from app.modules.conversation_archive import api as conversation_archive_api
 from app.modules.dashboard import api as dashboard_api
 from app.modules.dashboard_auth import api as dashboard_auth_api
+from app.modules.dashboard_roles import api as dashboard_roles_api
+from app.modules.dashboard_users import api as dashboard_users_api
+from app.modules.dashboard_users.identity_resolver import get_identity_resolution_cache
 from app.modules.firewall import api as firewall_api
 from app.modules.fleet import api as fleet_api
 from app.modules.health import api as health_api
@@ -116,7 +129,10 @@ from app.modules.rate_limit_reset_credits import api as rate_limit_reset_credits
 from app.modules.reports import api as reports_api
 from app.modules.reports.cache import ReportsCaches
 from app.modules.request_logs import api as request_logs_api
+from app.modules.role_mappings import api as role_mappings_api
 from app.modules.runtime import api as runtime_api
+from app.modules.scim import api as scim_api
+from app.modules.scim import management_api as scim_tokens_api
 from app.modules.settings import api as settings_api
 from app.modules.settings.service import warn_environment_shadowed_by_dashboard
 from app.modules.sticky_sessions import api as sticky_sessions_api
@@ -466,6 +482,10 @@ async def _report_dashboard_timeout_overrides(settings: Settings) -> None:
         return
     warn_environment_shadowed_by_dashboard(dashboard_settings_row, settings)
     validate_timeout_invariants(effective_settings(dashboard_settings_row, settings), strict=False, log=True)
+    # R2 spool retention: same warn-only shape. The environment alias alone can
+    # sit below the replay floor with the dashboard column NULL, a state the
+    # settings API never validated, so say so before an edit is refused.
+    warn_spool_retention_below_floor(dashboard_settings_row, settings)
 
 
 @asynccontextmanager
@@ -488,6 +508,7 @@ async def lifespan(app: FastAPI):
     startup_module._startup_complete = False
     startup_module.reset_bridge_registration()
     await get_settings_cache().invalidate(propagate=False)
+    await get_dashboard_users_cache().invalidate(propagate=False)
     await get_rate_limit_headers_cache().invalidate()
     reload_additional_quota_registry()
     settings = get_settings()
@@ -525,7 +546,10 @@ async def lifespan(app: FastAPI):
                 },
             )
         purged_operation_rows = await _purge_operation_spool_on_startup(
-            retention_seconds=settings.http_responses_session_bridge_operation_spool_retention_seconds,
+            # R2 spool retention: the dashboard column wins over the deprecated
+            # env alias; ``dashboard_settings`` is the snapshot this startup
+            # step already loaded above.
+            retention_seconds=resolve_operation_spool_retention_seconds(dashboard_settings, startup_settings=settings),
         )
         if purged_operation_rows > 0:
             logger.info(
@@ -537,6 +561,7 @@ async def lifespan(app: FastAPI):
         NAMESPACE_ACCOUNT_ROUTING,
         NAMESPACE_ACCOUNT_SELECTION,
         NAMESPACE_API_KEY,
+        NAMESPACE_DASHBOARD_USERS,
         NAMESPACE_FIREWALL,
         NAMESPACE_MODEL_REGISTRY,
         NAMESPACE_RESET_CREDITS,
@@ -546,6 +571,7 @@ async def lifespan(app: FastAPI):
         get_cache_invalidation_poller,
         set_cache_invalidation_poller,
     )
+    from app.core.config.context_window_overrides import get_model_context_window_overrides_cache
     from app.core.middleware.firewall_cache import get_firewall_ip_cache
     from app.core.upstream_proxy.cache import get_upstream_route_cache
     from app.modules.proxy.account_cache import get_account_selection_cache, get_routing_availability_cache
@@ -571,10 +597,30 @@ async def lifespan(app: FastAPI):
         NAMESPACE_SETTINGS,
         lambda: get_settings_cache().invalidate(propagate=False),
     )
+    # Then pull the new row in. Readers that cannot await the cache (the
+    # conversation archive gate runs per archived frame) would otherwise keep
+    # the pre-change snapshot on a replica that is only carrying already-open
+    # streams; the invalidate above already expired it, so a failed refresh
+    # degrades to the ordinary TTL reload instead of serving a stale value.
+    cache_poller.on_invalidation(NAMESPACE_SETTINGS, get_settings_cache().refresh)
+    cache_poller.on_invalidation(
+        NAMESPACE_DASHBOARD_USERS,
+        lambda: get_dashboard_users_cache().invalidate(propagate=False),
+    )
+    # Provider settings and identity resolutions ride the same bus: a PATCH on
+    # one replica bumps dashboard_users, every replica drops both caches.
+    cache_poller.on_invalidation(NAMESPACE_DASHBOARD_USERS, get_auth_provider_registry().clear)
+    cache_poller.on_invalidation(NAMESPACE_DASHBOARD_USERS, get_identity_resolution_cache().clear)
     cache_poller.on_invalidation(NAMESPACE_UPSTREAM_ROUTE, get_upstream_route_cache().clear)
     # The route resolver also reads the dashboard settings row (routing enabled
     # + default pool id), so settings bumps clear resolved routes as well.
     cache_poller.on_invalidation(NAMESPACE_SETTINGS, get_upstream_route_cache().clear)
+    # M4 model catalogue: the per-model context window override rows are
+    # invalidated through the settings namespace as well.
+    cache_poller.on_invalidation(
+        NAMESPACE_SETTINGS,
+        lambda: get_model_context_window_overrides_cache().invalidate(propagate=False),
+    )
     # The bus carries no payload, so a peer redeem clears this replica's whole
     # reset-credits store; the refresh scheduler repopulates it on its next tick.
     cache_poller.on_invalidation(NAMESPACE_RESET_CREDITS, get_rate_limit_reset_credits_store().invalidate)
@@ -634,6 +680,7 @@ async def lifespan(app: FastAPI):
             seeded_count,
         )
 
+    metadata_scheduler = build_metadata_refresh_scheduler()
     usage_scheduler = build_usage_refresh_scheduler()
     api_key_limit_reset_scheduler = build_api_key_limit_reset_scheduler()
     api_key_last_used_flush_scheduler = build_api_key_last_used_flush_scheduler()
@@ -651,6 +698,7 @@ async def lifespan(app: FastAPI):
     # even if a nested lifespan on another loop replaces the module-global
     # singleton in the meantime; shutdown below stops exactly this instance.
     live_usage_ingestor = start_live_usage_ingestor()
+    await metadata_scheduler.start()
     await usage_scheduler.start()
     await api_key_limit_reset_scheduler.start()
     await api_key_last_used_flush_scheduler.start()
@@ -873,6 +921,7 @@ async def lifespan(app: FastAPI):
         await auth_guardian_scheduler.stop()
         await automations_scheduler.stop()
         await sticky_session_cleanup_scheduler.stop()
+        await metadata_scheduler.stop()
         await model_scheduler.stop()
         # Stop the invalidation poller only after the model scheduler: a final
         # leader tick may still bump through the installed poller.
@@ -951,10 +1000,14 @@ def create_app() -> FastAPI:
     app.add_middleware(cast(Any, InFlightMiddleware))
     add_dashboard_gzip_middleware(app)
     add_dashboard_auth_proxy_middleware(app)
+    add_dashboard_csrf_middleware(app)
     add_request_decompression_middleware(app)
     add_request_body_limit_middleware(app)
     add_multipart_content_encoding_middleware(app)
     add_required_capability_http_middleware(app)
+    from app.core.wire_capture import WireCaptureMiddleware
+
+    app.add_middleware(WireCaptureMiddleware)
     add_request_id_middleware(app)
     add_api_firewall_middleware(app)
     app.add_middleware(cast(Any, MetricsMiddleware), enabled=settings.metrics_enabled)
@@ -1002,11 +1055,18 @@ def create_app() -> FastAPI:
     app.include_router(runtime_api.router)
     app.include_router(oauth_api.router)
     app.include_router(dashboard_auth_api.router)
+    app.include_router(dashboard_users_api.router)
+    app.include_router(dashboard_roles_api.router)
+    app.include_router(auth_providers_api.router)
+    app.include_router(role_mappings_api.router)
+    app.include_router(scim_api.router)
+    app.include_router(scim_tokens_api.router)
     app.include_router(settings_api.router)
     app.include_router(telemetry_api.router)
     app.include_router(firewall_api.router)
     app.include_router(fleet_api.router)
     app.include_router(sticky_sessions_api.router)
+    app.include_router(cache_isolation_probe_api.router)
     app.include_router(automations_api.router)
     app.include_router(api_keys_api.router)
     app.include_router(model_sources_api.router)
@@ -1016,7 +1076,11 @@ def create_app() -> FastAPI:
     index_html = static_dir / "index.html"
     static_root = static_dir.resolve()
     frontend_build_hint = "Frontend assets are missing. Run `cd frontend && bun run build`."
-    excluded_prefixes = ("api/", "v1/", "backend-api/", "health")
+    # ``scim/`` is here for a reason the others are not: an identity provider
+    # probes for resources this release does not implement (Groups,
+    # ServiceProviderConfig), and answering those with index.html and a 200
+    # tells it they are supported. They must be a SCIM 404.
+    excluded_prefixes = ("api/", "v1/", "backend-api/", "health", "scim/")
 
     def _is_static_asset_path(path: str) -> bool:
         if path.startswith("assets/"):

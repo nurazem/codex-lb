@@ -120,7 +120,7 @@ anything else belongs in `app/core/config/settings.py`.
 | `CODEX_LB_COMPACT_REQUEST_BUDGET_SECONDS` | T3 (dashboard) | `float` | `180.0` |
 | `CODEX_LB_HTTP_CONNECTOR_LIMIT` | T1 | `int` | `100` |
 | `CODEX_LB_HTTP_CONNECTOR_LIMIT_PER_HOST` | T1 | `int` | `50` |
-| `CODEX_LB_HTTP_RESPONSES_STREAM_REQUEST_BUDGET_SECONDS` | T3 | `float` | `7200.0` |
+| `CODEX_LB_HTTP_RESPONSES_STREAM_REQUEST_BUDGET_SECONDS` | T3 (dashboard) | `float` | `7200.0` |
 | `CODEX_LB_SSE_KEEPALIVE_INTERVAL_SECONDS` | T3 (dashboard) | `float` | `10.0` |
 | `CODEX_LB_STREAM_IDLE_TIMEOUT_SECONDS` | T3 (dashboard) | `float` | `7200.0` |
 | `CODEX_LB_TRANSCRIPTION_REQUEST_BUDGET_SECONDS` | T3 (dashboard) | `float` | `120.0` |
@@ -130,8 +130,7 @@ anything else belongs in `app/core/config/settings.py`.
 | Environment variable | Tier | Type | Default |
 | --- | --- | --- | --- |
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ADVERTISE_BASE_URL` | T1 | `str \| None` | `None` |
-| `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE` | T3 | `'fail_closed' \| 'client_full_history_once' \| 'server_anchored_replay_once' \| 'server_indefinite_recovery'` | `'fail_closed'` |
-| `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_CODEX_PREWARM_ENABLED` | T3 | `bool` | `False` |
+| `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_CODEX_PREWARM_ENABLED` | T3 (dashboard) | `bool` | `False` |
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_ENABLED` | T4 | `bool` | `True` |
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_INSTANCE_ID` | T1 | `str` | process hostname |
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_INSTANCE_RING` | T1 | `list[str]` | `[]` |
@@ -142,9 +141,9 @@ anything else belongs in `app/core/config/settings.py`.
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_OPERATION_EVENT_SPOOL_MAX_PENDING_BYTES` | T1 | `int` | `33554432` |
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_OPERATION_EVENT_SPOOL_MAX_PENDING_EVENTS` | T1 | `int` | `2048` |
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_OPERATION_SPOOL_FORMAT` | T1 | `'rows_v1' \| 'chunks_v2'` | `'rows_v1'` |
-| `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_OPERATION_SPOOL_RETENTION_SECONDS` | T3 | `float` | `604800` |
+| `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_OPERATION_SPOOL_RETENTION_SECONDS` | T3 (dashboard) | `float` | `604800` |
 | `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_QUEUE_LIMIT` | T1 | `int` | `8` |
-| `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_REQUEST_BUDGET_SECONDS` | T3 | `float` | `7200.0` |
+| `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_REQUEST_BUDGET_SECONDS` | T3 (dashboard) | `float` | `7200.0` |
 
 ## Proxy admission & account caps
 
@@ -176,22 +175,21 @@ anything else belongs in `app/core/config/settings.py`.
 
 | Environment variable | Tier | Type | Default |
 | --- | --- | --- | --- |
-| `CODEX_LB_AUTH_GUARDIAN_ENABLED` | T3 | `bool` | `True` |
-| `CODEX_LB_TOKEN_REFRESH_INTERVAL_DAYS` | T3 | `int` | `8` |
+| `CODEX_LB_AUTH_GUARDIAN_ENABLED` | T3 (dashboard) | `bool` | `True` |
 
 ## Usage
 
 | Environment variable | Tier | Type | Default |
 | --- | --- | --- | --- |
 | `CODEX_LB_ADDITIONAL_QUOTA_REGISTRY_FILE` | T1 | `Path \| None` | `None` |
-| `CODEX_LB_RATE_LIMIT_RESET_CREDITS_REFRESH_ENABLED` | T3 | `bool` | `True` |
+| `CODEX_LB_RATE_LIMIT_RESET_CREDITS_REFRESH_ENABLED` | T3 (dashboard) | `bool` | `True` |
 
 ## Model registry
 
 | Environment variable | Tier | Type | Default |
 | --- | --- | --- | --- |
-| `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES` | T3 | `dict[str, int]` | `{}` |
-| `CODEX_LB_MODEL_REGISTRY_CLIENT_VERSION` | T1 | `str` | `'0.153.4'` |
+| `CODEX_LB_MODEL_CONTEXT_WINDOW_OVERRIDES` | T3 (dashboard) | `dict[str, int]` | `{}` |
+| `CODEX_LB_MODEL_REGISTRY_CLIENT_VERSION` | T1 | `str` | `'0.154.0'` |
 | `CODEX_LB_MODEL_REGISTRY_SNAPSHOT_MAX_AGE_SECONDS` | T1 | `int` | `86400` |
 
 ## Firewall
@@ -209,6 +207,7 @@ anything else belongs in `app/core/config/settings.py`.
 | --- | --- | --- | --- |
 | `CODEX_LB_CONNECT_ADDRESS` | T1 | `str \| None` | `None` |
 | `CODEX_LB_DASHBOARD_AUTH_MODE` | T1 | `'standard' \| 'trusted_header' \| 'disabled'` | `'standard'` |
+| `CODEX_LB_DASHBOARD_AUTH_PROXY_GROUPS_HEADER` | T1 | `str` | `'Remote-Groups'` |
 | `CODEX_LB_DASHBOARD_AUTH_PROXY_HEADER` | T1 | `str` | `'Remote-User'` |
 | `CODEX_LB_DASHBOARD_BOOTSTRAP_TOKEN` | T0 | `str \| None` | `None` |
 | `CODEX_LB_DASHBOARD_TRUST_LOOPBACK_HOST_HEADER_FOR_LONG_SESSIONS` | T1 | `bool` | `False` |
@@ -218,14 +217,14 @@ anything else belongs in `app/core/config/settings.py`.
 | Environment variable | Tier | Type | Default |
 | --- | --- | --- | --- |
 | `CODEX_LB_CONVERSATION_ARCHIVE_DIR` | T1 | `Path` | `<data_dir>/conversation-archive` |
-| `CODEX_LB_CONVERSATION_ARCHIVE_ENABLED` | T3 | `bool` | `False` |
+| `CODEX_LB_CONVERSATION_ARCHIVE_ENABLED` | T3 (dashboard) | `bool` | `False` |
 | `CODEX_LB_CONVERSATION_ARCHIVE_QUEUE_MAX_BYTES` | T1 | `int` | `268435456` |
 
 ## Schedulers
 
 | Environment variable | Tier | Type | Default |
 | --- | --- | --- | --- |
-| `CODEX_LB_AUTOMATIONS_SCHEDULER_ENABLED` | T3 | `bool` | `True` |
+| `CODEX_LB_AUTOMATIONS_SCHEDULER_ENABLED` | T3 (dashboard) | `bool` | `True` |
 
 ## Multi-replica
 
@@ -263,11 +262,19 @@ anything else belongs in `app/core/config/settings.py`.
 | Environment variable | Tier | Type | Default |
 | --- | --- | --- | --- |
 | `CODEX_LB_EVENT_LOOP_LAG_WARN_THRESHOLD_SECONDS` | T1 | `float` | `0.5` |
-| `CODEX_LB_TELEMETRY_ENABLED` | T3 | `bool \| None` | `None` |
+| `CODEX_LB_TELEMETRY_ENABLED` | T3 (dashboard) | `bool \| None` | `None` |
 | `CODEX_LB_TELEMETRY_ENDPOINT` | T1 | `str` | `'https://telemetry.tokmaxxing.com'` |
+| `CODEX_LB_THREAD_CACHE_IDENTITY_MODE` | T3 (dashboard) | `str` | `'shared'` |
 | `CODEX_LB_TIMEOUT_INVARIANT_VALIDATION_STRICT` | T4 | `bool` | `False` |
 
 ## Removed
+
+Images and default account probes choose `gpt-5.6-luna`, then `gpt-5.5`,
+using registry plan visibility and suppression. If neither qualifies, they
+use `gpt-5.6-luna`. Catalog visibility does not guarantee account access.
+There is no host-model setting. See the
+[Images spec](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/images-api-compat)
+and [probe spec](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/usage-refresh-policy).
 
 Removed settings (ignored with a one-release startup warning; each is now a
 fixed default or a dashboard runtime setting — see PRINCIPLES.md P2 /
@@ -314,6 +321,8 @@ issue [#1340](https://github.com/Soju06/codex-lb/issues/1340)):
 - `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_SERVER_RECOVERY_MAX_ATTEMPTS`
 - `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_CLEAN_CLOSE_RETRY_JITTER_MAX_SECONDS`
 - `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_OPERATION_LEDGER_ENABLED`
+- `CODEX_LB_HTTP_RESPONSES_SESSION_BRIDGE_AMBIGUOUS_CONTINUATION_RECOVERY_MODE`
+- `CODEX_LB_TOKEN_REFRESH_INTERVAL_DAYS`
 
 ---
 
