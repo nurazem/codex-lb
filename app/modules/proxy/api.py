@@ -9044,6 +9044,38 @@ def _collect_output_item_event(
     return True
 
 
+def _canonical_item_event(
+    payload: dict[str, JsonValue], output_items: dict[int, dict[str, JsonValue]]
+) -> dict[str, JsonValue] | None:
+    """Repair only stable-ID drift into an unoccupied slot, never registration."""
+    event_type = payload.get("type")
+    index = payload.get("output_index")
+    if not isinstance(event_type, str) or not event_type.startswith("response."):
+        return payload
+    if event_type == "response.output_item.added" or not isinstance(index, int) or isinstance(index, bool):
+        return payload
+    item = payload.get("item")
+    identity = item.get("id") if isinstance(item, dict) else payload.get("item_id")
+    if not isinstance(identity, str) or not identity:
+        return payload
+    matches = [slot for slot, registered in output_items.items() if registered.get("id") == identity]
+    if len(matches) > 1:
+        return None
+    if not matches or matches[0] == index:
+        return payload
+    canonical = matches[0]
+    registered = output_items[canonical]
+    if index in output_items:
+        return None
+    if isinstance(item, dict) and item.get("type") != registered.get("type"):
+        return None
+    if event_type.startswith("response.web_search_call.") and registered.get("type") != "web_search_call":
+        return None
+    if event_type.startswith("response.reasoning_") and registered.get("type") != "reasoning":
+        return None
+    return {**payload, "output_index": canonical}
+
+
 def _merge_collected_output_items(
     response: Mapping[str, JsonValue],
     output_items: dict[int, dict[str, JsonValue]],
@@ -9333,8 +9365,14 @@ async def _normalize_public_responses_stream_impl(
                 yield formatted_payload
             return
 
-        if enforce_openai_sdk_contract and not _collect_output_item_event(
-            normalized_payload, output_items, completed_output_indexes
+        canonical_payload = (
+            _canonical_item_event(normalized_payload, output_items)
+            if enforce_openai_sdk_contract
+            else normalized_payload
+        )
+        if enforce_openai_sdk_contract and (
+            canonical_payload is None
+            or not _collect_output_item_event(canonical_payload, output_items, completed_output_indexes)
         ):
             for formatted_payload in _public_response_failed_event_blocks(
                 "upstream_output_item_conflict",
@@ -9344,6 +9382,8 @@ async def _normalize_public_responses_stream_impl(
             ):
                 yield formatted_payload
             return
+        assert canonical_payload is not None
+        normalized_payload = canonical_payload
         if event_type == "response.output_text.delta":
             seen_text_delta_keys.add(_text_delta_stream_key(normalized_payload))
         # Both the backfill branch and _normalize_public_stream_payload copy
