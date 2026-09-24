@@ -1,0 +1,3 @@
+- [x] Implement identity-safe public terminal collection and explicit conflict failure.
+- [x] Verify shifted completion replay and conflict controls plus existing public-response tests.
+- [x] Replay retained streams privately; record results without committing payloads.
