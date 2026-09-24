@@ -3,7 +3,9 @@
 ## Purpose
 
 Define Responses API compatibility contracts so Codex, OpenCode, and OpenAI-style clients preserve expected behavior.
+
 ## Requirements
+
 ### Requirement: Use prompt_cache_key as OpenAI cache affinity
 For OpenAI-style `/v1/responses`, `/v1/responses/compact`, and chat-completions requests mapped onto Responses, the service MUST treat a non-empty `prompt_cache_key` as the bounded upstream account affinity key for prompt-cache correctness even when a `session_id` header is present. OpenAI-style route wiring MUST NOT upgrade those requests to durable `CODEX_SESSION` affinity by default. This affinity MUST apply even when dashboard `sticky_threads_enabled` is disabled, the service MUST continue forwarding the same `prompt_cache_key` upstream unchanged, and the stored affinity MUST expire after the configured freshness window so older keys can rebalance. The freshness window MUST come from dashboard settings so operators can adjust it without restart.
 
@@ -10767,7 +10769,6 @@ If reconstruction encounters invalid item identity or index, conflicting complet
 - **WHEN** the terminal response contains non-empty valid output
 - **THEN** the service uses that terminal output without merging earlier snapshots
 
-
 ### Requirement: Non-streaming collection owns disconnect settlement
 
 While collecting a synchronous non-streaming Responses result, the proxy MUST observe downstream ASGI disconnect. A disconnect before collection finishes MUST cancel the owned collection once and await its existing cleanup. The observer MUST NOT independently release a reservation owned by the service, trigger failover, or infer remote settlement. A completed collection MUST preserve its result and terminal usage settlement when completion and disconnect become observable together. Request teardown MUST leave no unowned disconnect watcher or collection task.
@@ -10799,7 +10800,6 @@ Non-streaming response collection MUST join its existing cleanup owner without r
 - **WHEN** the caller's cancellation scope remains cancelled while owned cleanup waits
 - **THEN** unrelated event-loop tasks continue to run
 - **AND** the original cleanup completes once before collection exits
-
 
 ### Requirement: Rebuilt deployment preserves response identity and generic HTTP 429 classification
 
@@ -10934,3 +10934,26 @@ SDK parser failure.
 - **WHEN** the bridge settles the turn
 - **THEN** it emits one terminal `response.failed` event
 - **AND** that terminal event includes a stable `response.id`
+
+### Requirement: Identity-safe terminal backfill
+The public Responses normalizer SHALL associate a completed output item with its unique registered identity and type when its reported completion index is unoccupied. It SHALL retain registration order and emit each identity once when backfilling an empty terminal output. It SHALL preserve nonempty upstream terminal output. Public item-scoped lifecycle events SHALL carry the unique registered index when the reported target is unoccupied; native passthrough SHALL retain upstream indexes.
+
+#### Scenario: Shifted completion
+- **WHEN** an item completes at an unoccupied index different from its unique registration
+- **THEN** the terminal backfill contains the completed item at its registered position, without a stale duplicate
+
+#### Scenario: Conflicting lifecycle evidence
+- **WHEN** identity is ambiguous, the shifted target belongs to another item, item type changes, or a repeated completion conflicts
+- **THEN** the public stream terminates with a protocol error instead of fabricating a successful terminal snapshot
+
+
+### Requirement: Canonical public streamed item indexes
+The public Responses stream SHALL use the uniquely registered output index for later item-scoped events with a matching stable item ID when the reported target index is unoccupied. It SHALL reject conflicting registrations, types, occupied targets and completed contents rather than infer ownership. It SHALL preserve native passthrough and leave nonempty terminal output authoritative.
+
+#### Scenario: Hosted-search completion index drift
+- **WHEN** a search registers at N and completes at unoccupied N+1 with the same ID
+- **THEN** its public lifecycle and item completion carry N and its terminal backfill contains one completed item
+
+#### Scenario: Native stream
+- **WHEN** SDK contract enforcement is disabled
+- **THEN** upstream item indexes remain unchanged

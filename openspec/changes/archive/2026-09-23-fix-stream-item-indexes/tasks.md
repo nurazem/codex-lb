@@ -1,0 +1,3 @@
+- [x] Reconcile public item-scoped event indexes by unique registered identity, preserving conflict rejection.
+- [x] Cover hosted-search/reasoning drift and native passthrough; replay captured failing streams without private payloads in git.
+- [x] Validate and sync the Responses spec.
