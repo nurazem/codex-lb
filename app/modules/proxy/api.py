@@ -9003,15 +9003,45 @@ async def _collect_responses_payload(
 def _collect_output_item_event(
     payload: dict[str, JsonValue],
     output_items: dict[int, dict[str, JsonValue]],
-) -> None:
+    completed_indexes: set[int],
+) -> bool:
+    """Collect terminal evidence by identity without rewriting upstream events."""
     event_type = payload.get("type")
     if event_type not in ("response.output_item.added", "response.output_item.done"):
-        return
+        return True
     output_index = payload.get("output_index")
     item = payload.get("item")
-    if not isinstance(output_index, int) or not isinstance(item, dict):
-        return
+    if not isinstance(output_index, int) or isinstance(output_index, bool) or not isinstance(item, dict):
+        return True
+    identity = item.get("id")
+    matches = [
+        index
+        for index, previous in output_items.items()
+        if isinstance(identity, str) and identity and previous.get("id") == identity
+    ]
+    if len(matches) > 1:
+        return False
+    if matches:
+        canonical = matches[0]
+        previous = output_items[canonical]
+        if previous.get("type") != item.get("type"):
+            return False
+        if canonical != output_index:
+            if event_type != "response.output_item.done" or output_index in output_items:
+                return False
+            output_index = canonical
+    elif output_index in output_items:
+        # A slot cannot change owner, including anonymous or missing identities.
+        if output_items[output_index].get("id") != identity:
+            return False
+        if output_items[output_index].get("type") != item.get("type"):
+            return False
+    if output_index in completed_indexes:
+        return output_items[output_index] == item
     output_items[output_index] = dict(item)
+    if event_type == "response.output_item.done":
+        completed_indexes.add(output_index)
+    return True
 
 
 def _merge_collected_output_items(
@@ -9083,6 +9113,7 @@ async def _normalize_public_responses_stream_impl(
     # ``stream.get_final_response().output`` see the same items the
     # non-streaming endpoint returns.
     output_items: dict[int, dict[str, JsonValue]] = {}
+    completed_output_indexes: set[int] = set()
     # Track whether the first standard ``response.*`` event the public stream
     # emits is ``response.created``. The OpenAI Responses SSE contract requires
     # ``response.created`` to be the first event. The upstream Codex backend
@@ -9302,7 +9333,17 @@ async def _normalize_public_responses_stream_impl(
                 yield formatted_payload
             return
 
-        _collect_output_item_event(normalized_payload, output_items)
+        if enforce_openai_sdk_contract and not _collect_output_item_event(
+            normalized_payload, output_items, completed_output_indexes
+        ):
+            for formatted_payload in _public_response_failed_event_blocks(
+                "upstream_output_item_conflict",
+                include_created=not created_emitted,
+                sequence_number=next_sequence_number,
+                response_id=established_response_id,
+            ):
+                yield formatted_payload
+            return
         if event_type == "response.output_text.delta":
             seen_text_delta_keys.add(_text_delta_stream_key(normalized_payload))
         # Both the backfill branch and _normalize_public_stream_payload copy
@@ -10130,6 +10171,8 @@ def _looks_like_sse_comment_block(event_block: str) -> bool:
 
 
 def _public_contract_error_message(kind: str) -> str:
+    if kind == "upstream_output_item_conflict":
+        return "Upstream output item identity or completion evidence conflicts"
     if kind == "invalid_json":
         return "Responses stream produced an invalid JSON payload"
     if kind == "invalid_output_item":

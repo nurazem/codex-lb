@@ -2457,3 +2457,81 @@ async def test_collect_responses_preserves_done_payload_order_duplicates_and_fir
     assert body["output"] == [call, message]
     assert body["status"] == terminal_type.removeprefix("response.")
     assert drained
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion_index", [2, 5])
+async def test_terminal_backfill_uses_identity_for_shifted_completions(completion_index: int) -> None:
+    reasoning = {"id": "r", "type": "reasoning", "summary": []}
+    finished_reasoning = {**reasoning, "summary": [{"type": "summary_text", "text": "Checked"}]}
+    function = {
+        "id": "f",
+        "type": "function_call",
+        "name": "lookup",
+        "call_id": "call_f",
+        "arguments": "",
+        "status": "in_progress",
+    }
+    finished_function = {**function, "arguments": "{}", "status": "completed"}
+    events = [
+        {"type": "response.created", "response": {"id": "resp_test", "status": "in_progress", "output": []}},
+        {"type": "response.output_item.added", "output_index": 0, "item": reasoning},
+        {"type": "response.output_item.done", "output_index": completion_index - 1, "item": finished_reasoning},
+        {"type": "response.output_item.added", "output_index": 1, "item": function},
+        {"type": "response.output_item.done", "output_index": completion_index, "item": finished_function},
+        {"type": "response.completed", "response": {"id": "resp_test", "status": "completed", "output": []}},
+    ]
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(*(format_sse_event(cast(dict[str, JsonValue], e)) for e in events))
+        )
+    ]
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    terminal = next(p for p in payloads if p and p.get("type") == "response.completed")
+    assert cast(dict, terminal["response"])["output"] == [finished_reasoning, finished_function]
+    # Completion wire indexes are retained, not silently rewritten.
+    assert [p["output_index"] for p in payloads if p and p.get("type") == "response.output_item.done"] == [
+        completion_index - 1,
+        completion_index,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", ["occupied", "type", "duplicate_registration", "completed_content"])
+async def test_terminal_backfill_rejects_conflicting_evidence(conflict: str) -> None:
+    first = {"id": "a", "type": "reasoning", "summary": []}
+    second = {"id": "b", "type": "reasoning", "summary": []}
+    events = [
+        {"type": "response.created", "response": {"id": "resp_test", "status": "in_progress", "output": []}},
+        {"type": "response.output_item.added", "output_index": 0, "item": first},
+    ]
+    if conflict == "occupied":
+        events += [
+            {"type": "response.output_item.added", "output_index": 1, "item": second},
+            {"type": "response.output_item.done", "output_index": 1, "item": first},
+        ]
+    elif conflict == "type":
+        events += [{"type": "response.output_item.done", "output_index": 0, "item": {**first, "type": "message"}}]
+    elif conflict == "duplicate_registration":
+        events += [{"type": "response.output_item.added", "output_index": 1, "item": first}]
+    else:
+        events += [
+            {"type": "response.output_item.done", "output_index": 0, "item": first},
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {**first, "summary": [{"type": "summary_text", "text": "Different"}]},
+            },
+        ]
+    events += [{"type": "response.completed", "response": {"id": "resp_test", "status": "completed", "output": []}}]
+    blocks = [
+        block
+        async for block in proxy_api_module._normalize_public_responses_stream(
+            _iter_blocks(*(format_sse_event(cast(dict[str, JsonValue], e)) for e in events))
+        )
+    ]
+    payloads = [proxy_api_module._parse_sse_payload(block) for block in blocks]
+    assert not any(p and p.get("type") == "response.completed" for p in payloads)
+    failed = next(p for p in payloads if p and p.get("type") == "response.failed")
+    assert cast(dict, failed["response"])["error"]["code"] == "upstream_output_item_conflict"
