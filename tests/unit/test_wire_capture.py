@@ -75,10 +75,15 @@ async def test_normalizer_retains_both_boundaries_and_shifted_index(captured):
             yield "data: " + json.dumps(event) + "\n\n"
 
     output = [block async for block in _normalize_public_responses_stream(source())]
-    assert any('"output_index":10' in block.replace(" ", "") for block in output)
-    for direction in ("normalizer_input", "normalizer_output"):
+    # The normalizer reconciles the drifted index to the item's registered slot,
+    # so the input boundary keeps upstream's 10 and the output boundary shows 7.
+    assert any('"output_index":7,"item_id":"fn_test"' in block.replace(" ", "") for block in output)
+    assert not any('"output_index":10' in block.replace(" ", "") for block in output)
+    for direction, index in (("normalizer_input", 10), ("normalizer_output", 7)):
         records = [r for r in captured if r["direction"] == direction]
-        assert any('"output_index":10' in r["payload"]["text"].replace(" ", "") for r in records)
+        assert any(
+            f'"output_index":{index},"item_id":"fn_test"' in r["payload"]["text"].replace(" ", "") for r in records
+        )
         end = next(r for r in captured if r["direction"] == direction + "_end")
         assert end["payload"]["iterator_complete"]
         assert end["payload"]["events"] == len(records)
