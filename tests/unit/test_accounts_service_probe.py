@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -15,6 +17,7 @@ from app.modules.accounts.service import (
     PROBE_MAX_OUTPUT_TOKENS,
     AccountNotProbableError,
     AccountsService,
+    ProbeOutcome,
 )
 from app.modules.usage.updater import AccountRefreshResult
 
@@ -107,9 +110,9 @@ async def test_probe_account_allows_reauth_required_account(monkeypatch):
     service = _build_service(account=account)
     captured_kwargs: dict[str, object] = {}
 
-    async def _fake_probe(**kwargs: object) -> int:
+    async def _fake_probe(**kwargs: object) -> ProbeOutcome:
         captured_kwargs.update(kwargs)
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -131,7 +134,7 @@ async def test_probe_account_captures_before_after_snapshot(monkeypatch):
 
     async def _fake_probe(**kwargs):
         captured_kwargs.update(kwargs)
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -170,7 +173,7 @@ async def test_probe_account_reports_failed_usage_refresh(monkeypatch):
 
     async def _fake_probe(**kwargs):
         del kwargs
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -194,7 +197,7 @@ async def test_probe_account_invalidates_selection_cache_after_failed_refresh_at
 
     async def _fake_probe(**kwargs):
         del kwargs
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -223,7 +226,7 @@ async def test_probe_account_refreshes_token_before_sending_probe(monkeypatch):
 
     async def _fake_probe(**kwargs):
         captured_kwargs.update(kwargs)
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -242,7 +245,7 @@ async def test_probe_account_uses_default_model_when_omitted(monkeypatch):
 
     async def _fake_probe(**kwargs):
         captured_kwargs.update(kwargs)
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -258,7 +261,7 @@ async def test_probe_account_never_logs_access_token(monkeypatch, caplog):
 
     async def _fake_probe(**kwargs):
         # Simulate an upstream-side success without revealing the token.
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -274,7 +277,7 @@ async def test_probe_account_surfaces_network_failure_status(monkeypatch):
     service = _build_service(account=account, primary_pct=0.0, secondary_pct=0.0)
 
     async def _fake_probe(**kwargs):
-        return 0  # PROBE_NETWORK_FAILURE_STATUS sentinel
+        return ProbeOutcome(status_code=0)  # PROBE_NETWORK_FAILURE_STATUS sentinel
 
     monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
 
@@ -305,14 +308,43 @@ async def test_import_usage_refresh_allowed_tolerates_missing_upstream_proxy_set
     assert await service._import_usage_refresh_allowed(account) is True
 
 
-@pytest.mark.asyncio
-async def test_send_probe_request_uses_shared_http_client(monkeypatch):
-    account = _make_account()
-    service = _build_service(account=account)
+def _sse(*payloads: dict[str, Any]) -> list[bytes]:
+    lines: list[bytes] = []
+    for payload in payloads:
+        lines.append(f"event: {payload['type']}\n".encode())
+        lines.append(f"data: {json.dumps(payload)}\n".encode())
+        lines.append(b"\n")
+    return lines
+
+
+class _Content:
+    def __init__(self, lines: list[bytes], *, raise_after: BaseException | None = None) -> None:
+        self._lines = lines
+        self._raise_after = raise_after
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for line in self._lines:
+            yield line
+        if self._raise_after is not None:
+            raise self._raise_after
+
+
+def _install_probe_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: int,
+    lines: list[bytes] | None = None,
+    raise_after: BaseException | None = None,
+) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
     class _Response:
-        status = 204
+        def __init__(self) -> None:
+            self.status = status
+            self.content = _Content(lines or [], raise_after=raise_after)
 
         async def __aenter__(self):
             return self
@@ -336,14 +368,40 @@ async def test_send_probe_request_uses_shared_http_client(monkeypatch):
             return False
 
     monkeypatch.setattr("app.modules.accounts.service.lease_http_session", lambda: _Lease())
+    return captured
 
-    status = await service._send_probe_request(
+
+_CREATED = {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}
+_IN_PROGRESS = {"type": "response.in_progress", "response": {"id": "resp_1", "status": "in_progress"}}
+_COMPLETED = {"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}
+# The incident shape: HTTP 200, normal lifecycle frames, then the turn is refused in-stream.
+_OVERLOADED = {
+    "type": "response.failed",
+    "response": {
+        "id": "resp_1",
+        "status": "failed",
+        "error": {"code": "server_is_overloaded", "message": "Our servers are currently overloaded."},
+    },
+}
+
+
+async def _send(service: AccountsService) -> ProbeOutcome:
+    return await service._send_probe_request(
         access_token=_PROBE_TOKEN_PLAINTEXT,
         chatgpt_account_id=_CHATGPT_ACCOUNT_ID,
         model="gpt-5.5-test",
     )
 
-    assert status == 204
+
+@pytest.mark.asyncio
+async def test_send_probe_request_uses_shared_http_client(monkeypatch):
+    service = _build_service(account=_make_account())
+    captured = _install_probe_transport(monkeypatch, status=200, lines=_sse(_CREATED, _IN_PROGRESS, _COMPLETED))
+
+    outcome = await _send(service)
+
+    assert outcome == ProbeOutcome(status_code=200, stream_terminal="response.completed")
+    assert outcome.succeeded is True
     assert captured["leased"] is True
     assert captured["released"] is True
     assert captured["url"].endswith("/backend-api/codex/responses")
@@ -357,3 +415,111 @@ async def test_send_probe_request_uses_shared_http_client(monkeypatch):
     assert captured["timeout"].total == 30.0
     assert captured["timeout"].connect is None
     assert captured["timeout"].sock_connect == 10.0
+
+
+@pytest.mark.asyncio
+async def test_send_probe_request_reports_in_stream_overload_after_http_200(monkeypatch):
+    service = _build_service(account=_make_account())
+    _install_probe_transport(monkeypatch, status=200, lines=_sse(_CREATED, _IN_PROGRESS, _OVERLOADED))
+
+    outcome = await _send(service)
+
+    assert outcome.status_code == 200
+    assert outcome.stream_terminal == "response.failed"
+    assert outcome.stream_error_code == "server_is_overloaded"
+    assert outcome.succeeded is False
+
+
+@pytest.mark.asyncio
+async def test_send_probe_request_reports_a_bare_error_frame(monkeypatch):
+    service = _build_service(account=_make_account())
+    error_frame = {"type": "error", "error": {"type": "server_error", "code": "server_error", "message": "boom"}}
+    _install_probe_transport(monkeypatch, status=200, lines=_sse(_CREATED, error_frame))
+
+    outcome = await _send(service)
+
+    assert (outcome.stream_terminal, outcome.stream_error_code) == ("error", "server_error")
+
+
+@pytest.mark.asyncio
+async def test_send_probe_request_counts_an_incomplete_turn_as_served(monkeypatch):
+    # The probe caps output at the token floor, so upstream may stop the turn at
+    # max_output_tokens: it admitted and ran it, which is all the probe asks.
+    service = _build_service(account=_make_account())
+    incomplete = {
+        "type": "response.incomplete",
+        "response": {"id": "resp_1", "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+    }
+    _install_probe_transport(monkeypatch, status=200, lines=_sse(_CREATED, incomplete))
+
+    outcome = await _send(service)
+
+    assert outcome == ProbeOutcome(status_code=200, stream_terminal="response.incomplete")
+    assert outcome.succeeded is True
+
+
+@pytest.mark.asyncio
+async def test_send_probe_request_reports_a_stream_that_ends_without_a_terminal(monkeypatch):
+    service = _build_service(account=_make_account())
+    _install_probe_transport(monkeypatch, status=200, lines=_sse(_CREATED, _IN_PROGRESS))
+
+    outcome = await _send(service)
+
+    assert outcome == ProbeOutcome(status_code=200, stream_error_code="stream_incomplete")
+
+
+@pytest.mark.asyncio
+async def test_send_probe_request_keeps_the_status_when_the_stream_times_out(monkeypatch):
+    service = _build_service(account=_make_account())
+    _install_probe_transport(monkeypatch, status=200, lines=_sse(_CREATED), raise_after=asyncio.TimeoutError())
+
+    outcome = await _send(service)
+
+    assert outcome == ProbeOutcome(status_code=200, stream_error_code="probe_stream_timeout")
+
+
+@pytest.mark.asyncio
+async def test_send_probe_request_does_not_read_the_body_of_a_non_2xx_response(monkeypatch):
+    service = _build_service(account=_make_account())
+    _install_probe_transport(monkeypatch, status=429, lines=[b"not sse at all\n"])
+
+    outcome = await _send(service)
+
+    assert outcome == ProbeOutcome(status_code=429)
+
+
+@pytest.mark.asyncio
+async def test_probe_account_reports_the_in_stream_failure(monkeypatch):
+    service = _build_service(account=_make_account(), primary_pct=5.0, secondary_pct=5.0)
+
+    async def _fake_probe(**kwargs):
+        return ProbeOutcome(
+            status_code=200, stream_terminal="response.failed", stream_error_code="server_is_overloaded"
+        )
+
+    monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
+
+    result = await service.probe_account(_ACCOUNT_ID)
+
+    assert result is not None
+    assert result.probe_status_code == 200
+    assert result.probe_stream_terminal == "response.failed"
+    assert result.probe_stream_error_code == "server_is_overloaded"
+    assert result.probe_succeeded() is False
+    assert result.probe_settlement_http_status() == 502
+
+
+@pytest.mark.asyncio
+async def test_probe_account_settles_a_served_turn_with_its_own_status(monkeypatch):
+    service = _build_service(account=_make_account(), primary_pct=5.0, secondary_pct=5.0)
+
+    async def _fake_probe(**kwargs):
+        return ProbeOutcome(status_code=200, stream_terminal="response.completed")
+
+    monkeypatch.setattr(service, "_send_probe_request", _fake_probe)
+
+    result = await service.probe_account(_ACCOUNT_ID)
+
+    assert result is not None
+    assert result.probe_succeeded() is True
+    assert result.probe_settlement_http_status() == 200

@@ -37,6 +37,10 @@ class RuntimeState:
     # one-off fault never trips the window on its own, while a sustained
     # ``server_error`` refusal still deprioritizes the account.
     soft_overload_rejections: list[float] | None = None
+    # Every overload-class observation (explicit and bare, unweighted) inside
+    # the longer ratio window, so a steadily refused account with modest
+    # traffic trips even though it never fills the 120 s count window.
+    overload_rate_rejections: list[float] | None = None
     overload_backoff_until: float | None = None
     overload_backoff_level: int = 0
     overload_last_trip_at: float | None = None

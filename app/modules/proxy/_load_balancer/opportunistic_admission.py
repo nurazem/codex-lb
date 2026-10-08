@@ -157,6 +157,9 @@ def detached_runtime_snapshot(
             soft_overload_rejections=(
                 None if runtime.soft_overload_rejections is None else list(runtime.soft_overload_rejections)
             ),
+            overload_rate_rejections=(
+                None if runtime.overload_rate_rejections is None else list(runtime.overload_rate_rejections)
+            ),
             outcome_buckets=(
                 None
                 if runtime.outcome_buckets is None

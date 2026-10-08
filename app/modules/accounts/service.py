@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import aiohttp
@@ -91,6 +92,35 @@ PROBE_MAX_OUTPUT_TOKENS = 16
 # the value is distinguishable from any real HTTP status the upstream might
 # return.
 PROBE_NETWORK_FAILURE_STATUS = 0
+# Upstream refuses a turn with HTTP 200 and then a ``response.failed`` / ``error``
+# frame (``server_is_overloaded``, a bare ``server_error``), so the status alone
+# reports a refusing account as healthy. The probe reads the stream to its
+# terminal frame; these codes name the ways it can end without one.
+PROBE_STREAM_INCOMPLETE_CODE = "stream_incomplete"
+PROBE_STREAM_TIMEOUT_CODE = "probe_stream_timeout"
+_PROBE_SERVED_TERMINALS = frozenset({"response.completed", "response.incomplete"})
+_PROBE_FAILED_TERMINALS = frozenset({"response.failed", "error"})
+_PROBE_ERROR_CODE_MAX_CHARS = 64
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeOutcome:
+    """What a Force Probe saw: the upstream HTTP status and, for a 2xx, how the
+    SSE stream ended.
+
+    ``response.incomplete`` counts as served: the probe caps output at the Codex
+    token floor, so an incomplete turn means upstream admitted and ran it.
+    """
+
+    status_code: int
+    stream_terminal: str | None = None
+    stream_error_code: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return 200 <= self.status_code < 300 and self.stream_error_code is None
+
+
 IMPORT_PROXY_REQUIRED_PAUSE_REASON = "upstream_proxy_required_on_import"
 
 
@@ -712,7 +742,7 @@ class AccountsService:
 
         access_token = self._encryptor.decrypt(probe_account.access_token_encrypted)
         probe_model = model or resolve_default_host_model()
-        probe_status = await self._send_probe_request(
+        probe_outcome = await self._send_probe_request(
             access_token=access_token,
             chatgpt_account_id=probe_account.chatgpt_account_id,
             model=probe_model,
@@ -734,7 +764,9 @@ class AccountsService:
         response = AccountProbeResponse(
             status="probed",
             account_id=account_id,
-            probe_status_code=probe_status,
+            probe_status_code=probe_outcome.status_code,
+            probe_stream_terminal=probe_outcome.stream_terminal,
+            probe_stream_error_code=probe_outcome.stream_error_code,
             primary_used_percent_before=primary_before,
             primary_used_percent_after=primary_after,
             secondary_used_percent_before=secondary_before,
@@ -761,7 +793,7 @@ class AccountsService:
         access_token: str,
         chatgpt_account_id: str | None,
         model: str,
-    ) -> int:
+    ) -> ProbeOutcome:
         settings = get_settings()
         base = settings.upstream_base_url.rstrip("/")
         if "/backend-api" not in base:
@@ -795,15 +827,71 @@ class AccountsService:
             async with lease_http_session() as session:
                 async with session.post(url, headers=headers, json=body, timeout=timeout) as resp:
                     # Initiating the request is enough to wake the upstream
-                    # rate-limiter; we do not consume the SSE body.
-                    return resp.status
+                    # rate-limiter, but only the stream says whether upstream
+                    # actually served the turn.
+                    if not 200 <= resp.status < 300:
+                        return ProbeOutcome(status_code=resp.status)
+                    try:
+                        terminal, error_code = await _read_probe_stream(resp.content)
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        terminal, error_code = None, PROBE_STREAM_TIMEOUT_CODE
+                    if error_code is not None:
+                        logger.warning(
+                            "Probe stream failed after HTTP %s account=%s terminal=%s code=%s",
+                            resp.status,
+                            chatgpt_account_id,
+                            terminal,
+                            error_code,
+                        )
+                    return ProbeOutcome(status_code=resp.status, stream_terminal=terminal, stream_error_code=error_code)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.warning(
                 "Probe upstream request failed account=%s error=%s",
                 chatgpt_account_id,
                 exc,
             )
-            return PROBE_NETWORK_FAILURE_STATUS
+            return ProbeOutcome(status_code=PROBE_NETWORK_FAILURE_STATUS)
+
+
+async def _read_probe_stream(content: Any) -> tuple[str | None, str | None]:
+    """Read a probe's SSE body to its terminal frame: ``(terminal, error_code)``.
+
+    ``error_code`` is ``None`` only when upstream served the turn.
+    """
+    async for raw_line in content:
+        line = raw_line.decode("utf-8", "replace").strip() if isinstance(raw_line, bytes) else str(raw_line).strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        event_type = payload.get("type")
+        if event_type in _PROBE_SERVED_TERMINALS:
+            return event_type, None
+        if event_type in _PROBE_FAILED_TERMINALS:
+            return event_type, _probe_stream_error_code(payload)
+    return None, PROBE_STREAM_INCOMPLETE_CODE
+
+
+def _probe_stream_error_code(payload: dict[str, Any]) -> str:
+    response = payload.get("response")
+    candidates = (
+        response.get("error") if isinstance(response, dict) else None,
+        payload.get("error"),
+        payload,
+    )
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            code = candidate.get("code") or candidate.get("type")
+            if isinstance(code, str) and code.strip() and code not in _PROBE_FAILED_TERMINALS:
+                return code.strip()[:_PROBE_ERROR_CODE_MAX_CHARS]
+    return "upstream_error"
 
 
 def _opencode_auth_export_filename(account: Account) -> str:

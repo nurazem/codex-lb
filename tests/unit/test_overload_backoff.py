@@ -24,6 +24,7 @@ from app.core.balancer.logic import (
 from app.core.config.settings import get_settings
 from app.core.crypto import TokenEncryptor
 from app.db.models import Account, AccountStatus, StickySessionKind
+from app.modules.proxy._load_balancer.error_rate import record_outcome_locked
 from app.modules.proxy._load_balancer.overload_backoff import (
     BURST_BACKOFF_DEFAULT_SECONDS,
     BURST_BACKOFF_MAX_SECONDS,
@@ -32,6 +33,10 @@ from app.modules.proxy._load_balancer.overload_backoff import (
     OVERLOAD_ISOLATION_TRIP_LEVEL,
     OVERLOAD_LEVEL_DECAY_SECONDS,
     OVERLOAD_MAX_LEVEL,
+    OVERLOAD_RATE_TRIP_MIN_REJECTIONS,
+    OVERLOAD_RATE_TRIP_MIN_SAMPLES,
+    OVERLOAD_RATE_TRIP_RATIO,
+    OVERLOAD_RATE_WINDOW_SECONDS,
     OVERLOAD_TRIP_COUNT,
     OVERLOAD_WINDOW_SECONDS,
     SOFT_OVERLOAD_TRIP_WEIGHT,
@@ -136,6 +141,93 @@ def test_stale_soft_rejections_fall_out_of_the_window() -> None:
     later = OVERLOAD_WINDOW_SECONDS + 5.0
     assert record_overload_rejection_locked(runtime, later, soft=True) is None
     assert runtime.soft_overload_rejections == [later]
+
+
+def _steady_traffic(runtime: RuntimeState, *, start: float, seconds: float, per_minute: int) -> None:
+    """Record successful outcomes spread evenly, as a moderately loaded account sees them."""
+    total = int(seconds / 60.0 * per_minute)
+    for i in range(total):
+        record_outcome_locked(runtime, start + i * (seconds / max(total, 1)), success=True)
+
+
+def _refuse(runtime: RuntimeState, at: float, *, soft: bool) -> float | None:
+    # A refused turn is also an account-attributable failure in the outcome
+    # window (``record_errors``), recorded after the overload observation.
+    deadline = record_overload_rejection_locked(runtime, at, soft=soft)
+    record_outcome_locked(runtime, at, success=False)
+    return deadline
+
+
+def test_steady_refusal_at_modest_traffic_trips_on_the_ratio() -> None:
+    # The incident: ~4 requests/minute, one refusal every ~100 s (15%+ of
+    # turns), never three inside 120 s -- the count window alone never trips.
+    runtime = RuntimeState()
+    _steady_traffic(runtime, start=1000.0, seconds=500.0, per_minute=4)
+    refusals = [1000.0, 1100.0, 1200.0, 1300.0, 1400.0]
+    for at in refusals[:-1]:
+        assert _refuse(runtime, at, soft=True) is None
+        assert not overload_backoff_active(runtime, at)
+
+    deadline = record_overload_rejection_locked(runtime, refusals[-1], soft=True)
+
+    assert deadline == pytest.approx(refusals[-1] + OVERLOAD_BACKOFF_BASE_SECONDS)
+    assert runtime.overload_backoff_level == 1
+    assert runtime.overload_rate_rejections == []
+    assert runtime.overload_rejections == [] and runtime.soft_overload_rejections == []
+
+
+def test_a_busy_healthy_account_does_not_trip_on_scattered_rejections() -> None:
+    runtime = RuntimeState()
+    _steady_traffic(runtime, start=1000.0, seconds=500.0, per_minute=24)  # 200 outcomes
+    for at in (1000.0, 1100.0, 1200.0, 1300.0, 1400.0, 1499.0):
+        assert _refuse(runtime, at, soft=False) is None
+    assert not overload_backoff_active(runtime, 1499.0)
+
+
+def test_ratio_trip_needs_the_minimum_rejections() -> None:
+    runtime = RuntimeState()
+    _steady_traffic(runtime, start=1000.0, seconds=300.0, per_minute=2)  # 10 outcomes
+    for i in range(OVERLOAD_RATE_TRIP_MIN_REJECTIONS - 1):
+        assert _refuse(runtime, 1000.0 + i * 130.0, soft=True) is None
+    assert not overload_backoff_active(runtime, 1500.0)
+
+
+def test_ratio_trip_needs_the_minimum_samples() -> None:
+    # Five rejections and nothing else is too thin to judge a ratio by.
+    runtime = RuntimeState()
+    for i in range(OVERLOAD_RATE_TRIP_MIN_REJECTIONS):
+        assert record_overload_rejection_locked(runtime, 1000.0 + i * 130.0, soft=True) is None
+    assert OVERLOAD_RATE_TRIP_MIN_SAMPLES > OVERLOAD_RATE_TRIP_MIN_REJECTIONS
+
+
+def test_rejections_older_than_the_ratio_window_do_not_count() -> None:
+    runtime = RuntimeState()
+    for i in range(4):
+        _refuse(runtime, 1000.0 + i * 130.0, soft=True)
+    later = 1000.0 + 3 * 130.0 + OVERLOAD_RATE_WINDOW_SECONDS + 1.0
+    _steady_traffic(runtime, start=later - 300.0, seconds=300.0, per_minute=4)
+
+    assert _refuse(runtime, later, soft=True) is None
+    assert runtime.overload_rate_rejections == [later]
+
+
+def test_a_ratio_trip_resets_its_window_and_escalates_like_a_count_trip() -> None:
+    runtime = RuntimeState()
+    start = 1000.0
+    for trip in (1, 2):
+        _steady_traffic(runtime, start=start, seconds=500.0, per_minute=4)
+        for i in range(OVERLOAD_RATE_TRIP_MIN_REJECTIONS - 1):
+            assert _refuse(runtime, start + i * 100.0, soft=True) is None
+        deadline = _refuse(runtime, start + 400.0, soft=True)
+        assert deadline is not None
+        assert runtime.overload_backoff_level == trip
+        start += 700.0
+
+
+def test_ratio_threshold_sits_between_healthy_and_incident_rates() -> None:
+    # Healthy siblings stayed below 1% overload-class failures; the refused
+    # accounts ran at 15-16% per 10 minutes.
+    assert 0.01 < OVERLOAD_RATE_TRIP_RATIO < 0.15
 
 
 def test_soft_trip_weight_is_below_one_so_a_lone_fault_never_trips() -> None:

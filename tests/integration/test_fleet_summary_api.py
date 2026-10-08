@@ -14,7 +14,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, RequestKind, RequestLog, StickySession, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
-from app.modules.accounts.service import AccountsService
+from app.modules.accounts.service import AccountsService, ProbeOutcome
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeyData, ApiKeysService
 from app.modules.fleet import api as fleet_api
@@ -348,7 +348,7 @@ async def test_force_probe_advances_usage_freshness_without_changing_oauth_refre
 
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):
         del self, access_token, chatgpt_account_id, model
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _force_refresh_with_new_snapshot(self, account):
         await self._usage_repo.add_account_snapshot(
