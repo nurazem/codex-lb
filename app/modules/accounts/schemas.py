@@ -210,6 +210,10 @@ class AccountProbeRequest(DashboardModel):
     )
 
 
+# A probe answered HTTP 2xx but upstream failed the turn in-stream.
+PROBE_STREAM_FAILURE_SETTLEMENT_STATUS = 502
+
+
 class AccountProbeResponse(DashboardModel):
     _usage_refresh_fetch_succeeded: bool | None = PrivateAttr(default=None)
 
@@ -222,9 +226,24 @@ class AccountProbeResponse(DashboardModel):
     secondary_used_percent_after: float | None = None
     account_status_before: str
     account_status_after: str
+    # How the probe's SSE stream ended (``response.completed``, ``response.failed``,
+    # ...) and, when it did not serve the turn, why. ``None`` for a non-2xx probe.
+    probe_stream_terminal: str | None = None
+    probe_stream_error_code: str | None = None
 
     def usage_refresh_ready_for_probe_settlement(self) -> bool:
         return self._usage_refresh_fetch_succeeded is True
+
+    def probe_succeeded(self) -> bool:
+        """HTTP 2xx *and* a stream that served the turn."""
+        return 200 <= self.probe_status_code < 300 and self.probe_stream_error_code is None
+
+    def probe_settlement_http_status(self) -> int:
+        """Status to settle into replica-local health. A 2xx whose stream failed
+        settles as an upstream failure (502), never as a success."""
+        if 200 <= self.probe_status_code < 300 and self.probe_stream_error_code is not None:
+            return PROBE_STREAM_FAILURE_SETTLEMENT_STATUS
+        return self.probe_status_code
 
 
 class AccountUsageResetConsumeRequest(DashboardModel):

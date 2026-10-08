@@ -22,7 +22,7 @@ from app.db.session import SessionLocal
 from app.db.snapshot import clone_row
 from app.modules.accounts import api as accounts_api
 from app.modules.accounts.schemas import AccountProbeResponse
-from app.modules.accounts.service import AccountsService
+from app.modules.accounts.service import AccountsService, ProbeOutcome
 from app.modules.proxy.load_balancer import RuntimeState
 from app.modules.usage.updater import AccountRefreshResult, UsageUpdater
 
@@ -83,7 +83,7 @@ async def test_force_probe_settles_after_repository_session_closes(
 
     async def _fake_probe(self, **kwargs):  # noqa: ARG001
         """Accept the upstream probe without making a network request."""
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _fake_fetch_usage(**_kwargs):
         """Complete refresh without replacing the seeded usage-window rows."""
@@ -143,7 +143,7 @@ async def test_force_probe_settlement_keeps_health_guard_after_real_session_expi
 
     async def _fake_probe(self, **kwargs):  # noqa: ARG001
         """Accept the probe before injecting a concurrent runtime observation."""
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _fake_fetch_usage(**_kwargs):
         """Leave quota unconstrained so the test isolates concurrent health evidence."""
@@ -216,7 +216,7 @@ async def test_failed_force_probe_resets_real_balancer_streak(
 
     async def _fake_probe(self, **kwargs):  # noqa: ARG001
         """Return the selected upstream rejection or network-failure status."""
-        return probe_status
+        return ProbeOutcome(status_code=probe_status)
 
     async def _fake_fetch_usage(**_kwargs):
         """Complete post-probe usage refresh without adding quota pressure."""
@@ -314,7 +314,7 @@ async def test_probe_active_account_returns_snapshot(
         captured["chatgpt_account_id"] = chatgpt_account_id
         # Do not capture the access token — only assert it was non-empty.
         captured["had_token"] = bool(access_token)
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _force_refresh_fetches_without_writing(self, account, *, ignore_refresh_disabled=False):  # noqa: ARG001
         return AccountRefreshResult(usage_written=False, fetch_succeeded=True)
@@ -357,9 +357,18 @@ async def test_probe_active_account_returns_snapshot(
 async def test_probe_route_omits_unsupported_output_limit(async_client, monkeypatch):
     captured: dict[str, Any] = {}
 
+    class _Content:
+        # Force Probe reads a 2xx stream to its terminal frame.
+        def __aiter__(self):
+            return self._lines()
+
+        async def _lines(self):
+            yield b'data: {"type":"response.completed","response":{"id":"resp_probe","status":"completed"}}\n'
+
     class _Response:
         def __init__(self, status: int) -> None:
             self.status = status
+            self.content = _Content()
 
         async def __aenter__(self):
             return self
@@ -411,7 +420,7 @@ async def test_probe_active_account_returns_snapshot_when_advisory_settlement_fa
         del access_token
         del chatgpt_account_id
         del model
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _force_refresh_fetches_without_writing(self, account, *, ignore_refresh_disabled=False):  # noqa: ARG001
         return AccountRefreshResult(usage_written=False, fetch_succeeded=True)
@@ -440,6 +449,40 @@ async def test_probe_active_account_returns_snapshot_when_advisory_settlement_fa
         account_id=account_id,
         http_status=200,
     )
+
+
+@pytest.mark.asyncio
+async def test_probe_settles_an_in_stream_failure_after_http_200_as_a_failure(async_client, monkeypatch):
+    # The incident shape: upstream answers 200, then refuses the turn in-stream.
+    async def _fake_probe(self, *, access_token, chatgpt_account_id, model):
+        del access_token, chatgpt_account_id, model
+        return ProbeOutcome(
+            status_code=200, stream_terminal="response.failed", stream_error_code="server_is_overloaded"
+        )
+
+    async def _force_refresh_fetches_without_writing(self, account, *, ignore_refresh_disabled=False):  # noqa: ARG001
+        return AccountRefreshResult(usage_written=False, fetch_succeeded=True)
+
+    record_probe_result = AsyncMock()
+    monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
+    monkeypatch.setattr(UsageUpdater, "force_refresh_result", _force_refresh_fetches_without_writing)
+    proxy_service = type("_ProbeRecorder", (), {"record_account_probe_result": record_probe_result})()
+    monkeypatch.setattr(accounts_api, "get_proxy_service_for_app", lambda app: proxy_service)
+
+    account_id = await _import_test_account(
+        async_client,
+        email="probe-in-stream-overload@example.com",
+        account_id="acc_probe_in_stream_overload",
+    )
+
+    response = await async_client.post(f"/api/accounts/{account_id}/probe")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["probeStatusCode"] == 200
+    assert body["probeStreamTerminal"] == "response.failed"
+    assert body["probeStreamErrorCode"] == "server_is_overloaded"
+    record_probe_result.assert_awaited_once_with(account_id=account_id, http_status=502)
 
 
 @pytest.mark.asyncio
@@ -501,7 +544,7 @@ async def test_probe_failure_still_records_advisory_settlement_after_usage_refre
 @pytest.mark.asyncio
 async def test_force_probe_persists_free_to_plus_plan_upgrade(async_client, monkeypatch):
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):  # noqa: ARG001
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _fake_fetch_usage(**_kwargs):
         return UsagePayload.model_validate({"plan_type": "plus"})
@@ -532,7 +575,7 @@ async def test_force_probe_confirms_paid_to_free_plan_downgrade(async_client, mo
     second probe confirms it, instead of keeping a stale paid label forever."""
 
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):  # noqa: ARG001
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _fake_fetch_usage(**_kwargs):
         return UsagePayload.model_validate({"plan_type": "free"})
@@ -568,7 +611,7 @@ async def test_force_probe_keeps_paid_plan_for_unrecognized_payload_plan(async_c
     must never rewrite a stored paid plan, however often it repeats."""
 
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):  # noqa: ARG001
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _fake_fetch_usage(**_kwargs):
         return UsagePayload.model_validate({"plan_type": "mystery"})
@@ -608,7 +651,7 @@ async def test_pending_downgrade_evidence_is_persisted_for_all_replicas(async_cl
     from app.db.session import get_background_session
 
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):  # noqa: ARG001
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _fake_fetch_usage(**_kwargs):
         return UsagePayload.model_validate({"plan_type": "free"})
@@ -675,7 +718,7 @@ async def test_reimport_clears_pending_downgrade_evidence(async_client, monkeypa
     from app.db.session import get_background_session
 
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):  # noqa: ARG001
-        return 200
+        return ProbeOutcome(status_code=200)
 
     async def _fake_fetch_usage(**_kwargs):
         return UsagePayload.model_validate({"plan_type": "free"})
@@ -740,7 +783,7 @@ async def test_probe_uses_default_model_when_body_omitted(async_client, monkeypa
 
     async def _fake_probe(self, *, access_token, chatgpt_account_id, model):  # noqa: ARG001
         captured["model"] = model
-        return 200
+        return ProbeOutcome(status_code=200)
 
     monkeypatch.setattr(AccountsService, "_send_probe_request", _fake_probe)
 

@@ -43,6 +43,19 @@ account with two escalation stages:
    random pick would bounce the thread across siblings and be worse than the
    single rebind.
 
+**Two trip rules.** The 120-second count window catches a busy account that
+is refused in a burst. It cannot see a *moderately* loaded account that is
+refused steadily: at four requests a minute, a 25% refusal rate is about one
+rejection per 120 s, so the weighted count never reaches the threshold and the
+account stays in rotation indefinitely -- only the error-rate weight shaves
+its share, and established sticky owners keep landing there. The window
+therefore also trips on a *sustained ratio*: at least
+``OVERLOAD_RATE_TRIP_MIN_REJECTIONS`` overload-class observations (explicit and
+bare alike, unweighted) inside the error-rate window that make up at least
+``OVERLOAD_RATE_TRIP_RATIO`` of the account's recorded outcomes there, once the
+window holds ``OVERLOAD_RATE_TRIP_MIN_SAMPLES`` outcomes. A ratio trip is an
+ordinary trip: same level, deadline, decay and isolation escalation.
+
 In both stages the account is dropped from a candidate pool only while at
 least one other candidate remains, so the window can never empty the pool.
 The window is not reset by successes -- an account that succeeds on warm
@@ -73,6 +86,7 @@ from typing import Any
 
 from app.core.balancer.logic import AccountState
 from app.db.models import Account
+from app.modules.proxy._load_balancer.error_rate import ERROR_RATE_WINDOW_SECONDS, recent_outcomes
 from app.modules.proxy._load_balancer.tunables import RoutingTunables
 from app.modules.proxy._load_balancer.types import RuntimeState
 
@@ -96,6 +110,16 @@ SOFT_OVERLOAD_TRIP_WEIGHT = 0.5
 # account under real traffic trips within a minute or two.
 OVERLOAD_TRIP_COUNT = 3
 OVERLOAD_WINDOW_SECONDS = 120.0
+# Sustained-ratio trip over the error-rate window (see the module docstring).
+# Observed incident: two accounts refused 15-16% of their turns per 10 minutes
+# at ~4 requests/minute and never tripped the count window; healthy siblings
+# under the same traffic stayed below 1%. Five rejections keeps a quiet
+# account's one or two hiccups from tripping it, and ten outcomes is the same
+# evidence floor the error-rate weight uses.
+OVERLOAD_RATE_WINDOW_SECONDS = ERROR_RATE_WINDOW_SECONDS
+OVERLOAD_RATE_TRIP_MIN_REJECTIONS = 5
+OVERLOAD_RATE_TRIP_MIN_SAMPLES = 10
+OVERLOAD_RATE_TRIP_RATIO = 0.10
 # Bounded exponential deprioritization: 60 s, 120 s, 240 s, ... capped at 10 min.
 OVERLOAD_BACKOFF_BASE_SECONDS = 60.0
 OVERLOAD_BACKOFF_MAX_SECONDS = 600.0
@@ -179,6 +203,11 @@ def record_overload_rejection_locked(
     shared trip threshold, so they can trip the window on their own only when
     sustained, and they combine naturally with explicit overload rejections.
 
+    Independently of the count window, every observation (explicit or soft,
+    unweighted) also enters a longer ratio window; the window trips when those
+    observations reach ``OVERLOAD_RATE_TRIP_RATIO`` of the account's recorded
+    outcomes (``RuntimeState.outcome_buckets``) -- see the module docstring.
+
     When ``isolation`` says the new level isolates, the deadline is the
     isolation interval and ``runtime.overload_isolated_until`` is set to it.
     Caller holds the balancer's per-account lock.
@@ -191,16 +220,22 @@ def record_overload_rejection_locked(
     window_start = now - OVERLOAD_WINDOW_SECONDS
     hard = [at for at in (runtime.overload_rejections or ()) if at > window_start]
     soft_recent = [at for at in (runtime.soft_overload_rejections or ()) if at > window_start]
+    rate_window_start = now - OVERLOAD_RATE_WINDOW_SECONDS
+    rate_recent = [at for at in (runtime.overload_rate_rejections or ()) if at > rate_window_start]
+    rate_recent.append(now)
     if soft:
         soft_recent.append(now)
     else:
         hard.append(now)
-    if len(hard) + len(soft_recent) * SOFT_OVERLOAD_TRIP_WEIGHT < OVERLOAD_TRIP_COUNT:
+    count_trip = len(hard) + len(soft_recent) * SOFT_OVERLOAD_TRIP_WEIGHT >= OVERLOAD_TRIP_COUNT
+    if not count_trip and not _sustained_rejection_ratio(runtime, now, rejections=len(rate_recent)):
         runtime.overload_rejections = hard
         runtime.soft_overload_rejections = soft_recent
+        runtime.overload_rate_rejections = rate_recent
         return None
     runtime.overload_rejections = []
     runtime.soft_overload_rejections = []
+    runtime.overload_rate_rejections = []
     runtime.overload_backoff_level = min(runtime.overload_backoff_level + 1, OVERLOAD_MAX_LEVEL)
     runtime.overload_last_trip_at = now
     isolated = isolation is not None and isolation.isolates(runtime.overload_backoff_level)
@@ -218,6 +253,20 @@ def record_overload_rejection_locked(
     if isolated:
         runtime.overload_isolated_until = deadline
     return deadline
+
+
+def _sustained_rejection_ratio(runtime: RuntimeState, now: float, *, rejections: int) -> bool:
+    """Whether ``rejections`` overload observations are a sustained share of the
+    account's recent outcomes (the ratio trip rule)."""
+    if rejections < OVERLOAD_RATE_TRIP_MIN_REJECTIONS:
+        return False
+    successes, failures = recent_outcomes(runtime, now, window_seconds=OVERLOAD_RATE_WINDOW_SECONDS)
+    # The observation being recorded may not have reached the outcome window
+    # yet (health is written after it), so it is never allowed to exceed it.
+    samples = max(successes + failures, rejections)
+    if samples < OVERLOAD_RATE_TRIP_MIN_SAMPLES:
+        return False
+    return rejections / samples >= OVERLOAD_RATE_TRIP_RATIO
 
 
 async def record_upstream_overload(
