@@ -1429,10 +1429,15 @@ async def test_native_interpretation_drains_large_fragments_without_python_norma
         assert not block.python_normalization
         return normalizer(block)
 
-    def require_metadata(block: str, *, enforce_openai_sdk_contract: bool = True) -> tuple[str, str | None]:
+    def require_metadata(
+        block: str,
+        *,
+        enforce_openai_sdk_contract: bool = True,
+        identity: proxy_module._StreamResponseIdentity | None = None,
+    ) -> tuple[str, str | None]:
         assert isinstance(block, native_module.NativeResponsesEvent)
         assert not block.python_normalization
-        return classifier(block, enforce_openai_sdk_contract=enforce_openai_sdk_contract)
+        return classifier(block, enforce_openai_sdk_contract=enforce_openai_sdk_contract, identity=identity)
 
     monkeypatch.setattr(proxy_module, "_normalize_sse_event_block", require_native)
     monkeypatch.setattr(proxy_module, "_normalize_stream_payload_for_http_block", require_metadata)
