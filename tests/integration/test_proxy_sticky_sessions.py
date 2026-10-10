@@ -3221,3 +3221,193 @@ async def test_cleanup_retires_derived_prompt_cache_rows_and_keeps_client_sticky
 
     assert set(client_thread_keys) <= remaining, "a client-supplied sticky_thread row was swept by key prefix"
     assert not set(derived_prompt_cache_keys) & remaining, "derived prompt_cache rows should expire at the TTL"
+
+
+def _lowered_headers(headers) -> dict[str, str]:
+    return {key.lower(): value for key, value in headers.items()}
+
+
+async def _seed_primary_usage(account_usage: dict[str, float]) -> None:
+    now_epoch = int(utcnow().replace(tzinfo=timezone.utc).timestamp())
+    async with SessionLocal() as session:
+        usage_repo = UsageRepository(session)
+        for account_id, used_percent in account_usage.items():
+            await usage_repo.add_entry(
+                account_id=account_id,
+                used_percent=used_percent,
+                window="primary",
+                reset_at=now_epoch + 3600,
+                window_minutes=300,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/v1/responses", "/backend-api/codex/responses"])
+async def test_client_prompt_cache_key_forwards_derived_session_id_on_one_account(async_client, monkeypatch, route):
+    from app.modules.proxy.affinity import _prompt_cache_upstream_session_id
+
+    await _set_routing_settings(async_client, sticky_threads_enabled=False)
+    _install_proxy_settings_cache(monkeypatch, sticky_threads_enabled=False)
+    acc_a_id = await _import_account(async_client, "acc_pck_session_a", "pck_session_a@example.com")
+    acc_b_id = await _import_account(async_client, "acc_pck_session_b", "pck_session_b@example.com")
+    await _seed_primary_usage({acc_a_id: 10.0, acc_b_id: 20.0})
+
+    seen: list[tuple[str, str | None, str | None]] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
+        seen.append((account_id, _lowered_headers(headers).get("session_id"), payload.prompt_cache_key))
+        yield 'data: {"type":"response.completed","response":{"id":"resp_pck_session"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    def body(key: str) -> dict[str, object]:
+        return {"model": "gpt-5.1", "instructions": "hi", "input": "hello", "stream": True, "prompt_cache_key": key}
+
+    for _ in range(3):
+        response = await async_client.post(route, json=body("conversation-one"))
+        assert response.status_code == 200
+    # Usage now favours account B; the prompt-cache mapping must still hold A.
+    await _seed_primary_usage({acc_a_id: 60.0, acc_b_id: 5.0})
+    response = await async_client.post(route, json=body("conversation-one"))
+    assert response.status_code == 200
+    response = await async_client.post(route, json=body("conversation-two"))
+    assert response.status_code == 200
+
+    expected_one = _prompt_cache_upstream_session_id("conversation-one", {}, None)
+    expected_two = _prompt_cache_upstream_session_id("conversation-two", {}, None)
+    assert expected_one is not None and expected_two is not None and expected_one != expected_two
+    assert seen[:4] == [("acc_pck_session_a", expected_one, "conversation-one")] * 4
+    assert seen[4][1:] == (expected_two, "conversation-two")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["session_id", "x-codex-session-id", "thread-id"])
+async def test_explicit_session_header_wins_over_derived_prompt_cache_session(async_client, monkeypatch, header):
+    _install_proxy_settings_cache(monkeypatch, sticky_threads_enabled=False)
+    await _import_account(async_client, "acc_pck_explicit", "pck_explicit@example.com")
+
+    seen_headers: list[dict[str, str]] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
+        seen_headers.append(_lowered_headers(headers))
+        yield 'data: {"type":"response.completed","response":{"id":"resp_pck_explicit"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "input": "hello", "stream": True, "prompt_cache_key": "conversation-one"},
+        headers={header: "client-owned-session"},
+    )
+
+    assert response.status_code == 200
+    assert seen_headers[0][header] == "client-owned-session"
+    if header != "session_id":
+        assert "session_id" not in seen_headers[0]
+
+
+@pytest.mark.asyncio
+async def test_derived_prompt_cache_session_id_is_scoped_per_api_key(async_client, monkeypatch):
+    from app.modules.proxy.affinity import _prompt_cache_upstream_session_id
+
+    settings_response = await async_client.put(
+        "/api/settings",
+        json={"stickyThreadsEnabled": False, "preferEarlierResetAccounts": False, "apiKeyAuthEnabled": True},
+    )
+    assert settings_response.status_code == 200
+    await _import_account(async_client, "acc_pck_scoped", "pck_scoped@example.com")
+    async with SessionLocal() as session:
+        service = ApiKeysService(ApiKeysRepository(session))
+        first_key = await service.create_key(ApiKeyCreateData(name="pck first", allowed_models=None))
+        second_key = await service.create_key(ApiKeyCreateData(name="pck second", allowed_models=None))
+    _install_proxy_settings_cache(monkeypatch, sticky_threads_enabled=False)
+
+    seen: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
+        seen.append(_lowered_headers(headers).get("session_id"))
+        yield 'data: {"type":"response.completed","response":{"id":"resp_pck_scoped"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    for created in (first_key, second_key):
+        response = await async_client.post(
+            "/v1/responses",
+            json={"model": "gpt-5.1", "input": "hello", "stream": True, "prompt_cache_key": "shared-key"},
+            headers={"Authorization": f"Bearer {created.key}"},
+        )
+        assert response.status_code == 200
+
+    assert seen == [
+        _prompt_cache_upstream_session_id("shared-key", {}, first_key),
+        _prompt_cache_upstream_session_id("shared-key", {}, second_key),
+    ]
+    assert None not in seen and seen[0] != seen[1]
+
+
+@pytest.mark.asyncio
+async def test_prompt_cache_failover_keeps_derived_session_id(async_client, monkeypatch):
+    from app.modules.proxy.affinity import _prompt_cache_upstream_session_id
+
+    await _set_routing_settings(async_client, sticky_threads_enabled=False)
+    _install_proxy_settings_cache(monkeypatch, sticky_threads_enabled=False)
+    acc_a_id = await _import_account(async_client, "acc_pck_failover_a", "pck_failover_a@example.com")
+    acc_b_id = await _import_account(async_client, "acc_pck_failover_b", "pck_failover_b@example.com")
+    await _seed_primary_usage({acc_a_id: 10.0, acc_b_id: 20.0})
+
+    seen: list[tuple[str, str | None]] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
+        seen.append((account_id, _lowered_headers(headers).get("session_id")))
+        if account_id == "acc_pck_failover_a":
+            yield (
+                'data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded",'
+                '"message":"slow down"}}}\n\n'
+            )
+            return
+        yield 'data: {"type":"response.completed","response":{"id":"resp_pck_failover"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": "gpt-5.1", "input": "hello", "stream": True, "prompt_cache_key": "conversation-failover"},
+    )
+
+    assert response.status_code == 200
+    expected = _prompt_cache_upstream_session_id("conversation-failover", {}, None)
+    assert seen[:2] == [("acc_pck_failover_a", expected), ("acc_pck_failover_b", expected)]
+
+
+@pytest.mark.asyncio
+async def test_request_without_prompt_cache_key_forwards_no_derived_session_id(async_client, monkeypatch):
+    _install_proxy_settings_cache(monkeypatch, sticky_threads_enabled=False)
+    await _import_account(async_client, "acc_pck_keyless", "pck_keyless@example.com")
+
+    seen: list[tuple[str | None, str | None]] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kwargs):
+        seen.append((_lowered_headers(headers).get("session_id"), payload.prompt_cache_key))
+        yield 'data: {"type":"response.completed","response":{"id":"resp_pck_keyless"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.1",
+            "input": [
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "two"},
+                {"role": "user", "content": "three"},
+                {"role": "assistant", "content": "four"},
+                {"role": "user", "content": "five"},
+            ],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    session_id, forwarded_key = seen[0]
+    assert session_id is None
+    assert isinstance(forwarded_key, str) and forwarded_key.startswith("v2t-")

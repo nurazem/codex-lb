@@ -723,6 +723,7 @@ from app.modules.proxy._service.websocket.helpers import (
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _CodexSessionSource,
+    _prompt_cache_upstream_headers,  # noqa: F401
     _sticky_key_for_thread_goal_request,
     _sticky_key_from_session_header,  # noqa: F401
 )

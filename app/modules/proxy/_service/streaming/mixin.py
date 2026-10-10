@@ -585,7 +585,7 @@ class _StreamingMixin(_StreamingRetryMixin):
             stream = _facade()._call_stream_with_supported_optional_kwargs(
                 _facade().core_stream_responses,
                 payload,
-                headers,
+                _facade()._prompt_cache_upstream_headers(headers, payload, api_key),
                 access_token,
                 account_id,
                 optional_kwargs=stream_optional_kwargs,
