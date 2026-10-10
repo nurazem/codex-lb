@@ -211,6 +211,7 @@ from app.modules.proxy.account_eligibility import account_access_token_expires_a
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _extract_model_class,
+    _headers_with_upstream_session_id,
     _sticky_key_from_turn_state_header,
 )
 from app.modules.proxy.continuity import (
@@ -1494,7 +1495,7 @@ class _HTTPBridgeMixin(
                     )
                 )
                 create_kwargs: dict[str, Any] = {
-                    "headers": headers,
+                    "headers": _headers_with_upstream_session_id(headers, affinity.upstream_session_id),
                     "affinity": affinity,
                     "api_key": api_key,
                     "request_model": request_model,
