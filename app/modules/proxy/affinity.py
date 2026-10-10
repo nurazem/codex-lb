@@ -12,8 +12,8 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
-from typing import Literal, TypedDict
-from uuid import uuid4
+from typing import Literal, TypedDict, TypeVar
+from uuid import UUID, uuid4, uuid5
 
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
@@ -102,6 +102,11 @@ class _AffinityPolicy:
     # only: it never participates in routing, but it is the signal that tells
     # an operator whether unanchored threads are being held or are churning.
     prompt_cache_derivation_outcome: str | None = None
+    # Upstream ``session_id`` minted from a client ``prompt_cache_key`` when the
+    # request carries no Codex session or thread header. Egress only: it is
+    # never a routing key, and every path that strips session aliases before a
+    # fresh account (account-neutral recovery) resets the policy, dropping it.
+    upstream_session_id: str | None = None
 
     @property
     def selection_key(self) -> str | None:
@@ -404,6 +409,80 @@ def _derive_prompt_cache_anchor(
         else DERIVATION_OUTCOME_ANCHOR_NEW
     )
     return _PromptCacheAnchor(minted_key, outcome)
+
+
+# Fixed v5 namespace for upstream session ids minted from a client
+# ``prompt_cache_key``. Changing it would cold-start every such conversation's
+# upstream cache, so it is a literal rather than anything deployment-derived.
+_PROMPT_CACHE_SESSION_NAMESPACE = UUID("5f3c0822-07d7-4785-a39f-64bd0ec01efa")
+# First-party Codex sends its conversation identity under exactly this name.
+PROMPT_CACHE_UPSTREAM_SESSION_HEADER = "session_id"
+
+
+def _has_codex_session_identity_header(headers: Mapping[str, str]) -> bool:
+    return _process_session_key_from_headers(headers) is not None or _thread_id_from_headers(headers) is not None
+
+
+def _prompt_cache_upstream_session_id(
+    prompt_cache_key: str | None,
+    headers: Mapping[str, str],
+    api_key: ApiKeyData | None,
+) -> str | None:
+    """Upstream ``session_id`` for a client-keyed request that names no session.
+
+    Upstream only reuses its prompt cache for requests that carry a Codex
+    ``session_id``; a ``prompt_cache_key`` alone never hits. A client that keeps
+    one ``prompt_cache_key`` per conversation has already named the
+    conversation, so the proxy forwards a session id derived from it.
+
+    The id is a UUID (the shape first-party Codex sends), deterministic in
+    ``(api key id, prompt_cache_key)`` so every turn and every replica agrees,
+    and length-framed so two API keys can never mint the same id from the same
+    client key. An explicit session or thread header always wins: this returns
+    ``None`` and the client's header is forwarded untouched.
+
+    Proxy-derived (``v2t-``) keys are refused. The anchor derivation writes its
+    key back onto the payload, so a second resolution of the same body (bridge
+    to HTTP fallback, ring forwarding) would otherwise mistake it for a client
+    key and change behaviour for requests that never sent one. A client that
+    sends a ``v2t-`` key itself simply keeps today's behaviour.
+    """
+
+    if not isinstance(prompt_cache_key, str):
+        return None
+    key = prompt_cache_key.strip()
+    if not key or key.startswith(f"{_ANCHORED_KEY_VERSION}-"):
+        return None
+    if _has_codex_session_identity_header(headers):
+        return None
+    api_key_id = api_key.id if api_key is not None else ""
+    return str(uuid5(_PROMPT_CACHE_SESSION_NAMESPACE, f"{len(api_key_id)}:{api_key_id}:{key}"))
+
+
+_HeadersT = TypeVar("_HeadersT", bound=Mapping[str, str])
+
+
+def _headers_with_upstream_session_id(headers: _HeadersT, session_id: str | None) -> _HeadersT | dict[str, str]:
+    """Egress headers carrying ``session_id``; ``headers`` itself when nothing is added.
+
+    Callers apply this only to what is sent upstream. The request's own headers
+    stay the client's view for routing, owner lookup and request logs.
+    """
+
+    if session_id is None or _has_codex_session_identity_header(headers):
+        return headers
+    return {**headers, PROMPT_CACHE_UPSTREAM_SESSION_HEADER: session_id}
+
+
+def _prompt_cache_upstream_headers(
+    headers: _HeadersT,
+    payload: ResponsesRequest | ResponsesCompactRequest,
+    api_key: ApiKeyData | None,
+) -> _HeadersT | dict[str, str]:
+    """Upstream headers for one HTTP attempt of an already-resolved request."""
+
+    session_id = _prompt_cache_upstream_session_id(_prompt_cache_key_from_request_model(payload), headers, api_key)
+    return _headers_with_upstream_session_id(headers, session_id)
 
 
 def _derive_prompt_cache_key(
@@ -826,5 +905,13 @@ def _sticky_key_for_responses_request(
         and _request_allows_unavailable_legacy_owner_abandonment(payload)
     ):
         policy = replace(policy, abandon_unavailable_legacy_owner=True)
-    policy = replace(policy, prompt_cache_derivation_outcome=resolution.outcome)
+    policy = replace(
+        policy,
+        prompt_cache_derivation_outcome=resolution.outcome,
+        upstream_session_id=_prompt_cache_upstream_session_id(
+            resolution.sticky_key if resolution.source == "payload" else None,
+            headers,
+            api_key,
+        ),
+    )
     return _affinity_with_payload_continuity(policy, payload)
