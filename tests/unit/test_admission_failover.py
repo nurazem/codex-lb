@@ -462,3 +462,300 @@ async def test_refusal_on_every_account_surfaces_one_terminal_event(monkeypatch)
     assert [event["type"] for event in events] == ["response.failed"]
     error = cast(dict[str, object], cast(dict[str, object], events[0]["response"])["error"])
     assert error["code"] == "server_is_overloaded"
+
+
+# ---------------------------------------------------------------------------
+# Realistic Codex turns: vendor telemetry around the lifecycle prelude
+# ---------------------------------------------------------------------------
+#
+# Production (2026-11-12 20:25 UTC, after the prelude hold shipped): a Codex
+# CLI follow-up turn on the WebSocket upstream got ``codex.rate_limits`` before
+# ``response.created`` and then ``response.failed`` ``server_is_overloaded``.
+# The hold treated the telemetry frame as "the turn is running" and released,
+# so the refusal reached the client with no second selection.
+
+_CODEX_NATIVE_HEADERS = {"originator": "codex_exec", "session_id": "sid-codex-turn"}
+
+
+def _rate_limits() -> str:
+    return _sse(
+        {
+            "type": "codex.rate_limits",
+            "plan_type": "pro",
+            "rate_limits": {"primary": {"used_percent": 12.0, "window_minutes": 300}},
+        }
+    )
+
+
+def _websocket_timing() -> str:
+    return _sse({"type": "responsesapi.websocket_timing", "server_ms": 3})
+
+
+def _codex_follow_up_payload() -> ResponsesRequest:
+    # The shape ``codex exec`` sends on a follow-up turn: prompt_cache_key,
+    # store=false, encrypted reasoning carried forward, prior tool call and
+    # output, and a new user message. No previous_response_id.
+    return ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "You are Codex.",
+            "stream": True,
+            "store": False,
+            "prompt_cache_key": "codex-thread-0001",
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"effort": "medium", "summary": "auto"},
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell",
+                    "description": "Run a command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                    "strict": False,
+                }
+            ],
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list files"}]},
+                {"type": "reasoning", "summary": [], "encrypted_content": "gAAAA-turn-1-ciphertext"},
+                {"type": "function_call", "name": "shell", "arguments": '{"cmd":"ls"}', "call_id": "call_1"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "README.md"},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "now open it"}]},
+            ],
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [True, False], ids=["native_codex", "sdk_contract"])
+@pytest.mark.parametrize(
+    "telemetry",
+    ["rate_limits_before_created", "rate_limits_and_timing_inside_prelude"],
+)
+async def test_codex_turn_overload_refusal_after_telemetry_fails_over(monkeypatch, native, telemetry):
+    refusing = _make_account("acc_codex_overloaded")
+    healthy = _make_account("acc_codex_healthy")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        if account_id == refusing.chatgpt_account_id:
+            yield _rate_limits()
+            yield _created("resp_refused")
+            if telemetry == "rate_limits_and_timing_inside_prelude":
+                yield _websocket_timing()
+                yield _in_progress("resp_refused")
+                yield _rate_limits()
+            yield _overloaded("resp_refused")
+            return
+        yield _rate_limits()
+        yield _created("resp_served")
+        yield _completed("resp_served")
+
+    service, select_account = _stream_service(monkeypatch, refusing, healthy, fake_stream=fake_stream)
+    record_error = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "record_error", record_error)
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            _codex_follow_up_payload(),
+            dict(_CODEX_NATIVE_HEADERS) if native else {"session_id": "sid-codex-turn"},
+            enforce_openai_sdk_contract=not native,
+        )
+    ]
+    events = _events(chunks)
+
+    assert attempted == [refusing.chatgpt_account_id, healthy.chatgpt_account_id]
+    assert select_account.await_count == 2
+    assert refusing.id in select_account.await_args_list[1].kwargs["exclude_account_ids"]
+    assert "resp_refused" not in "".join(chunks)
+    assert "server_is_overloaded" not in "".join(chunks)
+    # Only the serving account's stream reaches the client, in upstream order.
+    assert [event["type"] for event in events] == ["codex.rate_limits", "response.created", "response.completed"]
+    assert [call.args[0].id for call in record_error.await_args_list] == [refusing.id]
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_telemetry_prelude_is_released_in_order_when_output_starts(monkeypatch):
+    # Held telemetry is never dropped or reordered: once output starts, the
+    # client gets every upstream frame in upstream order from the one account.
+    first = _make_account("acc_codex_runs")
+    second = _make_account("acc_codex_unused")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        yield _rate_limits()
+        yield _created("resp_runs")
+        yield _websocket_timing()
+        yield _in_progress("resp_runs")
+        yield _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "rs_runs", "type": "reasoning", "summary": []},
+            }
+        )
+        yield _completed("resp_runs")
+
+    service, select_account = _stream_service(monkeypatch, first, second, fake_stream=fake_stream)
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            _codex_follow_up_payload(), dict(_CODEX_NATIVE_HEADERS), enforce_openai_sdk_contract=False
+        )
+    ]
+
+    assert attempted == [first.chatgpt_account_id]
+    assert select_account.await_count == 1
+    assert [event["type"] for event in _events(chunks)] == [
+        "codex.rate_limits",
+        "response.created",
+        "responsesapi.websocket_timing",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.completed",
+    ]
+
+
+def _not_failed_over_reasons(caplog: pytest.LogCaptureFixture) -> list[str]:
+    prefix = "Overload refusal not failed over "
+    return [
+        record.getMessage().rsplit("reason=", 1)[1]
+        for record in caplog.records
+        if record.getMessage().startswith(prefix)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_on_previous_response_owner_is_not_moved_and_logs_why(monkeypatch, caplog):
+    # Safety rule: a turn anchored by previous_response_id (with encrypted
+    # reasoning) stays on its owner even with telemetry in the prelude; the
+    # relayed refusal is logged with the blocking condition.
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    owner = _make_account("acc_codex_prev_owner")
+    other = _make_account("acc_codex_prev_other")
+    request_logs.response_owner_by_id[("resp_codex_prev", None, "sid-codex-turn")] = owner.id
+    attempted: list[str | None] = []
+
+    async def fake_select_account(**kwargs):
+        if kwargs.get("required_account_id") == owner.id:
+            return AccountSelection(account=owner, error_message=None)
+        return AccountSelection(account=other, error_message=None)
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del payload, headers, access_token, base_url, raise_for_status, kwargs
+        attempted.append(account_id)
+        yield _rate_limits()
+        yield _created("resp_codex_owner_turn")
+        yield _overloaded("resp_codex_owner_turn")
+
+    select_account = AsyncMock(side_effect=fake_select_account)
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(service._load_balancer, "record_error", AsyncMock())
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=lambda account, **kwargs: account))
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = _codex_follow_up_payload().model_copy(update={"previous_response_id": "resp_codex_prev"})
+    caplog.set_level("INFO")
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            payload, dict(_CODEX_NATIVE_HEADERS), enforce_openai_sdk_contract=False
+        )
+    ]
+
+    assert attempted == [owner.chatgpt_account_id]
+    assert select_account.await_count == 1
+    assert [event["type"] for event in _events(chunks)] == ["codex.rate_limits", "response.created", "response.failed"]
+    assert _not_failed_over_reasons(caplog) == ["previous_response_owner"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "expected_reason"),
+    [
+        ("after_output", "released_by_event:response.output_item.added"),
+        ("billed", "refusal_reported_output"),
+        ("hold_expired", "hold_expired"),
+        ("every_account", "no_other_account"),
+    ],
+)
+async def test_relayed_overload_refusal_logs_the_blocking_condition(monkeypatch, caplog, case, expected_reason):
+    from app.modules.proxy._service import support as streaming_helpers
+
+    if case == "hold_expired":
+        monkeypatch.setattr(streaming_helpers, "_ADMISSION_PRELUDE_HOLD_SECONDS", 0.05)
+    first = _make_account("acc_log_first")
+    second = _make_account("acc_log_second")
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        response_id = f"resp_log_{account_id}"
+        yield _rate_limits()
+        yield _created(response_id)
+        if case == "after_output":
+            yield _sse(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"id": "rs_log", "type": "reasoning", "summary": []},
+                }
+            )
+        if case == "hold_expired":
+            await asyncio.sleep(0.3)
+        if case == "billed":
+            yield _overloaded(response_id, usage={"input_tokens": 5, "output_tokens": 3, "total_tokens": 8})
+        else:
+            yield _overloaded(response_id)
+
+    service, _ = _stream_service(monkeypatch, first, second, fake_stream=fake_stream)
+    caplog.set_level("INFO")
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            _codex_follow_up_payload(), dict(_CODEX_NATIVE_HEADERS), enforce_openai_sdk_contract=False
+        )
+    ]
+
+    assert "server_is_overloaded" in "".join(chunks)
+    assert _not_failed_over_reasons(caplog) == [expected_reason]
+
+
+@pytest.mark.asyncio
+async def test_relayed_overload_refusal_on_last_attempt_logs_no_attempts_left(monkeypatch, caplog):
+    accounts = [_make_account(f"acc_last_{index}") for index in range(proxy_service._STREAM_MAX_ACCOUNT_ATTEMPTS)]
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        yield _rate_limits()
+        yield _created(f"resp_last_{account_id}")
+        yield _overloaded(f"resp_last_{account_id}")
+
+    service, _ = _stream_service(monkeypatch, *accounts, fake_stream=fake_stream)
+    caplog.set_level("INFO")
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            _codex_follow_up_payload(), dict(_CODEX_NATIVE_HEADERS), enforce_openai_sdk_contract=False
+        )
+    ]
+
+    assert attempted == [account.chatgpt_account_id for account in accounts]
+    # Only the last account's refusal reaches the client.
+    assert [event["type"] for event in _events(chunks)] == ["codex.rate_limits", "response.created", "response.failed"]
+    assert _not_failed_over_reasons(caplog) == ["no_attempts_left"]

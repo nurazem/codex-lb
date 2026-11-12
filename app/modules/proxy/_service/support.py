@@ -2142,11 +2142,30 @@ def upstream_websocket_transport_recently_failed() -> bool:
 # Output-free lifecycle frames upstream sends before it decides whether to run
 # a turn. A movable HTTP stream attempt holds them back (see
 # ``_hold_admission_prelude``).
-_ADMISSION_PRELUDE_EVENT_TYPES = frozenset({"response.created", "response.in_progress"})
+_ADMISSION_PRELUDE_EVENT_TYPES = frozenset({"response.created", "response.queued", "response.in_progress"})
 # Longest the prelude is held while no further frame arrives. Production
 # refusals (2026-11-12) arrived 1.1-1.6 s (median) or 10-12 s after dispatch,
 # p95 12.4 s; the held prelude is released unchanged once this passes.
 _ADMISSION_PRELUDE_HOLD_SECONDS = 15.0
+# Cheap pre-filter for the refusal observer on lines that are passed through:
+# both overload codes (``server_is_overloaded``, ``overloaded_error``) contain it.
+_OVERLOAD_LINE_MARKER = "overloaded"
+
+
+def _is_admission_prelude_event(event_type: str | None) -> bool:
+    """Whether a frame says nothing about the turn running: lifecycle prelude or vendor telemetry.
+
+    Upstream sends vendor telemetry beside the lifecycle prelude: over the
+    WebSocket transport every Codex turn starts with ``codex.rate_limits``
+    before ``response.created``, and ``responsesapi.websocket_timing`` can
+    follow. Such frames carry no model output (public Responses streams drop
+    them, see ``_normalize_public_stream_payload``), so they are held with the
+    prelude instead of ending the hold. ``error`` and every other
+    ``response.*`` frame are not telemetry.
+    """
+    if event_type in _ADMISSION_PRELUDE_EVENT_TYPES:
+        return True
+    return isinstance(event_type, str) and event_type not in ("", "error") and not event_type.startswith("response.")
 
 
 def _requests_background_mode(payload: Any) -> bool:
@@ -2185,8 +2204,10 @@ def _is_output_free_overload_refusal(code: str | None, event_payload: Mapping[st
     return True
 
 
-def _admission_refusal(event_type: str | None, payload: Mapping[str, Any] | None) -> _RetryableStreamError | None:
-    """The retryable error for an explicit, output-free overload refusal frame, else ``None``."""
+def _overload_terminal(
+    event_type: str | None, payload: Mapping[str, Any] | None
+) -> tuple[str, Mapping[str, Any]] | None:
+    """``(code, error)`` of a terminal frame whose code is an explicit overload, else ``None``."""
     if event_type not in ("response.failed", "error") or not isinstance(payload, Mapping):
         return None
     response = payload.get("response")
@@ -2197,8 +2218,17 @@ def _admission_refusal(event_type: str | None, payload: Mapping[str, Any] | None
     code = _normalize_error_code(
         raw_code if isinstance(raw_code, str) else None, raw_type if isinstance(raw_type, str) else None
     )
-    if not _is_output_free_overload_refusal(code, payload):
+    if code not in UPSTREAM_OVERLOAD_CODES:
         return None
+    return code, error
+
+
+def _admission_refusal(event_type: str | None, payload: Mapping[str, Any] | None) -> _RetryableStreamError | None:
+    """The retryable error for an explicit, output-free overload refusal frame, else ``None``."""
+    terminal = _overload_terminal(event_type, payload)
+    if terminal is None or not _is_output_free_overload_refusal(terminal[0], payload):
+        return None
+    code, error = terminal
     message = error.get("message")
     upstream_error = cast(
         UpstreamError,
@@ -2207,27 +2237,51 @@ def _admission_refusal(event_type: str | None, payload: Mapping[str, Any] | None
     return _RetryableStreamError(code, upstream_error, exclude_account=True, admission_refused=True)
 
 
+def _log_overload_refusal_not_failed_over(request_id: str | None, account_id: str | None, reason: str) -> None:
+    logger.info(
+        "Overload refusal not failed over request_id=%s account_id=%s reason=%s",
+        request_id,
+        account_id,
+        reason,
+    )
+
+
 async def _next_stream_line(iterator: AsyncIterator[str]) -> str:
     return await iterator.__anext__()
 
 
 async def _hold_admission_prelude(
-    lines: AsyncIterator[str], *, scheduler: Scheduler, clock: Clock
+    lines: AsyncIterator[str],
+    *,
+    scheduler: Scheduler,
+    clock: Clock,
+    request_id: str | None = None,
+    account_id: str | None = None,
+    blocked_reason: str | None = None,
 ) -> AsyncIterator[str]:
-    """Hold ``response.created`` / ``response.in_progress`` until the turn shows it will run.
+    """Hold the output-free prelude until the turn shows it will run.
 
-    Wraps the lines one HTTP stream attempt delivers downstream. An explicit
-    overload refusal that follows only the prelude is raised as a retryable
-    admission refusal, so the retry loop moves the request to another account
-    before the client has seen anything. Any other line, the end of the
+    Wraps the lines one HTTP stream attempt delivers downstream. The prelude is
+    ``response.created`` / ``response.queued`` / ``response.in_progress`` plus
+    any vendor telemetry around them (``_is_admission_prelude_event``). An
+    explicit overload refusal that follows only the prelude is raised as a
+    retryable admission refusal, so the retry loop moves the request to another
+    account before the client has seen anything. Any other line, the end of the
     attempt, an error, or ``_ADMISSION_PRELUDE_HOLD_SECONDS`` without a line
-    releases the held prelude unchanged, so accepted work keeps its existing
-    visible, non-replayed handling. The next line is read in a scheduler task
-    (as the SSE keepalive injector does) so an expiring hold never cancels the
-    attempt. The caller keeps ownership of ``lines`` and closes it.
+    releases the held prelude unchanged and in order, so accepted work keeps
+    its existing visible, non-replayed handling. The next line is read in a
+    scheduler task (as the SSE keepalive injector does) so an expiring hold
+    never cancels the attempt. The caller keeps ownership of ``lines`` and
+    closes it.
+
+    ``blocked_reason`` is set when the attempt cannot move to another account:
+    nothing is held and lines pass through unchanged. Whenever an overload
+    refusal is relayed instead of failed over, the reason (``blocked_reason``,
+    or why the hold was released before the refusal arrived) is logged once.
     """
     iterator = lines.__aiter__()
-    held: list[str] | None = []
+    held: list[str] | None = None if blocked_reason is not None else []
+    release_reason = blocked_reason
     hold_deadline = clock.monotonic() + _ADMISSION_PRELUDE_HOLD_SECONDS
     pending: asyncio.Task[str] | None = None
     try:
@@ -2243,7 +2297,7 @@ async def _hold_admission_prelude(
                     except TimeoutError:
                         for held_line in held:
                             yield held_line
-                        held = None
+                        held, release_reason = None, "hold_expired"
                         line = await wait_on_shared_future(pending, scheduler=scheduler)
                     pending = None
                 else:
@@ -2260,15 +2314,25 @@ async def _hold_admission_prelude(
             if held is not None:
                 payload = parse_sse_data_json(line)
                 event_type = classify_event_type(payload)
-                if event_type in _ADMISSION_PRELUDE_EVENT_TYPES:
+                if _is_admission_prelude_event(event_type):
                     held.append(line)
                     continue
                 refusal = _admission_refusal(event_type, payload)
                 if refusal is not None:
                     raise refusal
+                if _overload_terminal(event_type, payload) is not None:
+                    _log_overload_refusal_not_failed_over(request_id, account_id, "refusal_reported_output")
+                    release_reason = None
+                else:
+                    release_reason = f"released_by_event:{event_type or 'unparsed'}"
                 for held_line in held:
                     yield held_line
                 held = None
+            elif release_reason is not None and _OVERLOAD_LINE_MARKER in line:
+                payload = parse_sse_data_json(line)
+                if _overload_terminal(classify_event_type(payload), payload) is not None:
+                    _log_overload_refusal_not_failed_over(request_id, account_id, release_reason)
+                    release_reason = None
             yield line
         for held_line in held or ():
             yield held_line

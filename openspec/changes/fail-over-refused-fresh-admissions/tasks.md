@@ -12,6 +12,10 @@
 - [x] 2.4 Regression tests: failover with and without a prelude, refusal after output, billed refusal, bare `server_error`, previous-response owner, refusal on every account, refusal after the hold expired
 - [x] 2.5 Hold above the attempt (in the retry loop), not in the streaming mixin: keeps the mixin at its line ratchet and releases the response-create slot on the first upstream frame; bound the hold at 15 s
 
+- [x] 2.6 Hold vendor telemetry (`codex.rate_limits`, `responsesapi.websocket_timing`, any non-`response.*` non-`error` type) and `response.queued` with the prelude: in production (2026-11-12 20:25 UTC) `codex.rate_limits` arrived before `response.created` on the WebSocket upstream and released the hold, so the refusal was relayed
+- [x] 2.7 Log `Overload refusal not failed over ... reason=<blocking condition>` whenever a refusal is relayed instead of failed over
+- [x] 2.8 Regression tests with a realistic Codex follow-up turn (encrypted reasoning, tool call/output, prompt_cache_key; native and SDK contract): telemetry before and inside the prelude fails over, telemetry is released in order when output starts, previous-response owner stays, and one log reason per relayed refusal
+
 ## 3. Isolated accounts while a healthy account is only capped
 
 - [x] 3.1 Signal account lease releases from the balancer

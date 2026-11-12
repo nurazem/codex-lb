@@ -74,6 +74,7 @@ from app.modules.proxy._service.support import (
     _account_capacity_wait_payload,
     _account_selection_recovery_sleep_seconds,
     _hold_admission_prelude,
+    _log_overload_refusal_not_failed_over,
     _request_log_client_fields,
     _requests_background_mode,
     _RetryableStreamError,
@@ -786,6 +787,31 @@ class _StreamingRetryMixin:
                 or account.id == file_preferred_account_id
                 or turn_state_owner_account_id is not None
             )
+
+        def _admission_hold_blocked_reason(account: Account, *, allow_retry: bool) -> str | None:
+            """Why this attempt cannot hold its prelude for an overload failover, or ``None``.
+
+            ``None`` exactly when the attempt can still move: attempts left,
+            not an account/model replacement, not owner-bound
+            (``_stream_owner_bound_to``) and not a background request.
+            """
+            if not allow_retry:
+                return "no_attempts_left"
+            if routing_strategy == "single_account":
+                return "single_account"
+            if account.id == account_model_replacement_account_id:
+                return "account_model_replacement"
+            if _stream_owner_bound_to(account):
+                if payload_replay_required_account_id == account.id:
+                    return "dispatched_payload_owner"
+                if turn_state_owner_account_id is not None:
+                    return "turn_state_owner"
+                if account.id == file_preferred_account_id:
+                    return "input_file_owner"
+                return "previous_response_owner"
+            if _requests_background_mode(payload):
+                return "background"
+            return None
 
         def _burst_same_account_retry_available(account: Account, *, burst: bool) -> bool:
             if not burst:
@@ -1740,6 +1766,8 @@ class _StreamingRetryMixin:
                     if propagate_http_errors and last_transient_exc is not None:
                         raise last_transient_exc
                     if last_retryable_stream_error is not None:
+                        if last_retryable_stream_error.admission_refused:
+                            _log_overload_refusal_not_failed_over(request_id, None, "no_other_account")
                         error_message = str(last_retryable_stream_error.error.get("message") or "Upstream error")
                         event = response_failed_event(
                             last_retryable_stream_error.code,
@@ -2318,15 +2346,15 @@ class _StreamingRetryMixin:
                             )
                             # Only an attempt that may still move to another
                             # account holds its lifecycle prelude so an overload
-                            # refusal can fail over; hard owners never do.
-                            attempt_lines: AsyncIterator[str] = (
-                                _hold_admission_prelude(inner_stream, scheduler=scheduler, clock=clock)
-                                if allow_retry_flag
-                                and routing_strategy != "single_account"
-                                and account.id != account_model_replacement_account_id
-                                and not _stream_owner_bound_to(account)
-                                and not _requests_background_mode(payload)
-                                else inner_stream
+                            # refusal can fail over; hard owners never do. The
+                            # others pass through and log why a refusal stayed.
+                            attempt_lines: AsyncIterator[str] = _hold_admission_prelude(
+                                inner_stream,
+                                scheduler=scheduler,
+                                clock=clock,
+                                request_id=request_id,
+                                account_id=account.id,
+                                blocked_reason=_admission_hold_blocked_reason(account, allow_retry=allow_retry_flag),
                             )
                             try:
                                 try:
