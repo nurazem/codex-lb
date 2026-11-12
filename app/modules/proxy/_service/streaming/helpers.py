@@ -1288,6 +1288,46 @@ def _push_stream_attempt_timeout_overrides(
     )
 
 
+# Output-free lifecycle frames upstream sends before it decides whether to run a
+# turn. The HTTP stream path may hold them back while the request can still move.
+_ADMISSION_PRELUDE_EVENT_TYPES = frozenset({"response.created", "response.in_progress"})
+
+
+def _requests_background_mode(payload: ResponsesRequest) -> bool:
+    return getattr(payload, "background", None) is True or (payload.model_extra or {}).get("background") is True
+
+
+def _is_output_free_overload_refusal(code: str | None, event_payload: Mapping[str, Any] | None) -> bool:
+    """Whether a terminal frame is an explicit overload refusal that produced nothing.
+
+    ``server_is_overloaded`` / ``overloaded_error`` mean upstream refused to run
+    the turn. A terminal that still reports output items or billed output or
+    reasoning tokens is not treated as a refusal.
+    """
+    if code not in UPSTREAM_OVERLOAD_CODES:
+        return False
+    response = event_payload.get("response") if isinstance(event_payload, Mapping) else None
+    if not isinstance(response, Mapping):
+        return True
+    output = response.get("output")
+    if isinstance(output, list) and output:
+        return False
+    usage = response.get("usage")
+    if isinstance(usage, Mapping):
+        output_tokens = usage.get("output_tokens")
+        if isinstance(output_tokens, (int, float)) and not isinstance(output_tokens, bool) and output_tokens > 0:
+            return False
+        details = usage.get("output_tokens_details")
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, Mapping) else None
+        if (
+            isinstance(reasoning_tokens, (int, float))
+            and not isinstance(reasoning_tokens, bool)
+            and reasoning_tokens > 0
+        ):
+            return False
+    return True
+
+
 def _should_retry_stream_error(code: str, message: str | None = None) -> bool:
     """Whether a pre-visible terminal frame may be retried on a sibling account.
 

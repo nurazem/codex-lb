@@ -671,11 +671,22 @@ def _request_log_client_fields(
 
 
 class _RetryableStreamError(Exception):
-    def __init__(self, code: str, error: UpstreamError, *, exclude_account: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        error: UpstreamError,
+        *,
+        exclude_account: bool = False,
+        admission_refused: bool = False,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.error = error
         self.exclude_account = exclude_account
+        # Upstream explicitly refused to admit the turn (overload) before any
+        # output and before anything reached the client: the attempt is not
+        # dispatch evidence, so it must not bind an account-bound body.
+        self.admission_refused = admission_refused
 
 
 class _WebSocketConnectFailureEmitted(Exception):

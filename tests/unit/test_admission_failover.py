@@ -171,3 +171,242 @@ async def test_account_bound_body_stays_on_owner_after_dispatched_rejection(monk
     assert not any("resp_should_not_happen" in chunk for chunk in chunks)
     failed = [json.loads(chunk.split("data: ", 1)[1]) for chunk in chunks if '"response.failed"' in chunk]
     assert failed and failed[-1]["response"]["error"]["code"] == "upstream_error"
+
+
+# ---------------------------------------------------------------------------
+# HTTP stream: an overload refusal after the lifecycle prelude
+# ---------------------------------------------------------------------------
+
+
+def _sse(payload: dict[str, object]) -> str:
+    return "data: " + json.dumps(payload) + "\n\n"
+
+
+def _created(response_id: str) -> str:
+    return _sse({"type": "response.created", "response": {"id": response_id, "status": "in_progress", "output": []}})
+
+
+def _in_progress(response_id: str) -> str:
+    return _sse(
+        {"type": "response.in_progress", "response": {"id": response_id, "status": "in_progress", "output": []}}
+    )
+
+
+def _overloaded(response_id: str, **response_fields: object) -> str:
+    return _sse(
+        {
+            "type": "response.failed",
+            "response": {
+                "id": response_id,
+                "status": "failed",
+                "output": [],
+                "error": {
+                    "code": "server_is_overloaded",
+                    "message": "Our servers are currently overloaded. Please try again later.",
+                },
+                **response_fields,
+            },
+        }
+    )
+
+
+def _completed(response_id: str) -> str:
+    return _sse(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+    )
+
+
+def _events(chunks: list[str]) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    for chunk in chunks:
+        for line in chunk.splitlines():
+            if line.startswith("data: ") and line != "data: [DONE]":
+                events.append(json.loads(line[len("data: ") :]))
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prelude", ["created_and_in_progress", "created_only", "none"])
+async def test_overload_refusal_before_output_fails_over_to_another_account(monkeypatch, prelude):
+    refusing = _make_account("acc_overloaded")
+    healthy = _make_account("acc_healthy")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        if account_id == refusing.chatgpt_account_id:
+            if prelude != "none":
+                yield _created("resp_refused")
+            if prelude == "created_and_in_progress":
+                yield _in_progress("resp_refused")
+            yield _overloaded("resp_refused")
+            return
+        yield _created("resp_served")
+        yield _completed("resp_served")
+
+    service, select_account = _stream_service(monkeypatch, refusing, healthy, fake_stream=fake_stream)
+    record_error = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "record_error", record_error)
+    payload = ResponsesRequest.model_validate(
+        {"model": "gpt-5.1", "instructions": "", "input": _ACCOUNT_BOUND_INPUT, "stream": True}
+    )
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-overload"})]
+    events = _events(chunks)
+
+    assert attempted == [refusing.chatgpt_account_id, healthy.chatgpt_account_id]
+    assert select_account.await_count == 2
+    # The second selection excluded the refusing account.
+    assert refusing.id in select_account.await_args_list[1].kwargs["exclude_account_ids"]
+    # The client never saw the refused response.
+    assert "resp_refused" not in "".join(chunks)
+    assert [event["type"] for event in events] == ["response.created", "response.completed"]
+    assert all(cast(dict[str, object], event["response"])["id"] == "resp_served" for event in events)
+    # The refusal still counts against the refusing account's health.
+    assert [call.args[0].id for call in record_error.await_args_list] == [refusing.id]
+
+
+@pytest.mark.asyncio
+async def test_overload_refusal_after_output_is_relayed_without_replay(monkeypatch):
+    refusing = _make_account("acc_overloaded_late")
+    healthy = _make_account("acc_healthy_late")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        yield _created("resp_late")
+        yield _sse(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": "rs_late", "type": "reasoning", "summary": []},
+            }
+        )
+        yield _overloaded("resp_late")
+
+    service, _ = _stream_service(monkeypatch, refusing, healthy, fake_stream=fake_stream)
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "", "input": "hi", "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-late"})]
+    events = _events(chunks)
+
+    assert attempted == [refusing.chatgpt_account_id]
+    assert [event["type"] for event in events] == [
+        "response.created",
+        "response.output_item.added",
+        "response.failed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_overload_refusal_reporting_output_tokens_is_not_replayed(monkeypatch):
+    refusing = _make_account("acc_overloaded_billed")
+    healthy = _make_account("acc_healthy_billed")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        yield _created("resp_billed")
+        yield _overloaded("resp_billed", usage={"input_tokens": 5, "output_tokens": 3, "total_tokens": 8})
+
+    service, _ = _stream_service(monkeypatch, refusing, healthy, fake_stream=fake_stream)
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "", "input": "hi", "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-billed"})]
+
+    assert attempted == [refusing.chatgpt_account_id]
+    assert [event["type"] for event in _events(chunks)] == ["response.created", "response.failed"]
+
+
+@pytest.mark.asyncio
+async def test_bare_server_error_after_prelude_is_not_replayed(monkeypatch):
+    # A bare server_error is ambiguous (it is not an explicit refusal): it keeps
+    # the existing no-replay contract and the prelude is released unchanged.
+    first = _make_account("acc_server_error")
+    second = _make_account("acc_server_error_other")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        yield _created("resp_server_error")
+        yield _sse(
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_server_error",
+                    "status": "failed",
+                    "error": {"code": "server_error", "message": "boom"},
+                },
+            }
+        )
+
+    service, _ = _stream_service(monkeypatch, first, second, fake_stream=fake_stream)
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "", "input": "hi", "stream": True})
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-server-error"})]
+
+    assert attempted == [first.chatgpt_account_id]
+    assert [event["type"] for event in _events(chunks)] == ["response.created", "response.failed"]
+
+
+@pytest.mark.asyncio
+async def test_overload_refusal_on_previous_response_owner_is_not_moved(monkeypatch):
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    owner = _make_account("acc_prev_owner_overloaded")
+    other = _make_account("acc_prev_other")
+    request_logs.response_owner_by_id[("resp_prev_anchor", None, "sid-owner")] = owner.id
+    attempted: list[str | None] = []
+
+    async def fake_select_account(**kwargs):
+        if kwargs.get("required_account_id") == owner.id:
+            return AccountSelection(account=owner, error_message=None)
+        return AccountSelection(account=other, error_message=None)
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del payload, headers, access_token, base_url, raise_for_status, kwargs
+        attempted.append(account_id)
+        yield _created("resp_owner_turn")
+        yield _overloaded("resp_owner_turn")
+
+    select_account = AsyncMock(side_effect=fake_select_account)
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(service._load_balancer, "record_error", AsyncMock())
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=lambda account, **kwargs: account))
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "",
+            "input": [],
+            "stream": True,
+            "previous_response_id": "resp_prev_anchor",
+        }
+    )
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-owner"})]
+    events = _events(chunks)
+
+    # Hard continuity: the turn stays on its owner and the refusal is relayed.
+    assert attempted == [owner.chatgpt_account_id]
+    assert select_account.await_count == 1
+    assert [event["type"] for event in events] == ["response.created", "response.failed"]
+    failed = cast(dict[str, object], events[-1]["response"])
+    assert cast(dict[str, object], failed["error"])["code"] == "server_is_overloaded"

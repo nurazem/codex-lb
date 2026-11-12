@@ -2313,6 +2313,15 @@ class _StreamingRetryMixin:
                                 tool_call_dedupe=tool_call_dedupe,
                                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                                 thread_cache_identity=ThreadCacheIdentity(thread_cache_identity_mode, account.id),
+                                # Only a request that may still move to another
+                                # account holds its prelude for an admission
+                                # refusal; hard continuity owners never do.
+                                retry_overload_admission_refusal=(
+                                    allow_retry_flag
+                                    and routing_strategy != "single_account"
+                                    and account.id != account_model_replacement_account_id
+                                    and not _stream_owner_bound_to(account)
+                                ),
                             )
                             try:
                                 try:
@@ -2330,11 +2339,14 @@ class _StreamingRetryMixin:
                                     # refused WebSocket upgrade) leaves it free
                                     # to make its first real dispatch elsewhere.
                                     if register_payload_owner and not (
-                                        isinstance(exc, ProxyResponseError)
-                                        and (
-                                            is_confirmed_pre_dispatch_transport_error(exc)
-                                            or is_undispatched_upstream_rejection(exc)
+                                        (
+                                            isinstance(exc, ProxyResponseError)
+                                            and (
+                                                is_confirmed_pre_dispatch_transport_error(exc)
+                                                or is_undispatched_upstream_rejection(exc)
+                                            )
                                         )
+                                        or (isinstance(exc, _RetryableStreamError) and exc.admission_refused)
                                     ):
                                         payload_replay_required_account_id = account.id
                                     raise
