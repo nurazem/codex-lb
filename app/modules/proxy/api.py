@@ -9033,7 +9033,23 @@ def _merge_collected_output_items(
     return merged
 
 
-async def _normalize_public_responses_stream(
+async def _normalize_public_responses_stream(stream: AsyncIterator[str], **kwargs: bool) -> AsyncIterator[str]:
+    from app.core.conversation_archive import archive_enabled
+    from app.core.wire_capture import archive_stream
+
+    if not archive_enabled():
+        async for block in _normalize_public_responses_stream_impl(stream, **kwargs):
+            yield block
+        return
+    capture_id = uuid4().hex
+    incoming = archive_stream(stream, "normalizer_input", capture_id)
+    async for block in archive_stream(
+        _normalize_public_responses_stream_impl(incoming, **kwargs), "normalizer_output", capture_id
+    ):
+        yield block
+
+
+async def _normalize_public_responses_stream_impl(
     stream: AsyncIterator[str],
     *,
     enforce_openai_sdk_contract: bool = True,

@@ -4098,6 +4098,9 @@ async def _stream_responses_with_session(
                 ) as routed_events:
                     async for event_block in routed_events:
                         last_stream_activity_at = time.monotonic()
+                        archive_text(
+                            direction="upstream_raw_http", kind="wire_capture", transport="http", text=event_block
+                        )
                         event_block = _normalize_sse_event_block(event_block)
                         event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
                             event_block,
@@ -4262,6 +4265,7 @@ async def _stream_responses_with_session(
             ) as direct_events:
                 async for event_block in direct_events:
                     last_stream_activity_at = time.monotonic()
+                    archive_text(direction="upstream_raw_http", kind="wire_capture", transport="http", text=event_block)
                     event_block = _normalize_sse_event_block(event_block)
                     event_block, normalized_event_type = _normalize_stream_payload_for_http_block(
                         event_block,

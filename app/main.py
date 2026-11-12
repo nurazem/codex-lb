@@ -1005,6 +1005,9 @@ def create_app() -> FastAPI:
     add_request_body_limit_middleware(app)
     add_multipart_content_encoding_middleware(app)
     add_required_capability_http_middleware(app)
+    from app.core.wire_capture import WireCaptureMiddleware
+
+    app.add_middleware(WireCaptureMiddleware)
     add_request_id_middleware(app)
     add_api_firewall_middleware(app)
     app.add_middleware(cast(Any, MetricsMiddleware), enabled=settings.metrics_enabled)

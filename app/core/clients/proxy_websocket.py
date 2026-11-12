@@ -654,6 +654,14 @@ class ArchivingUpstreamWebSocket:
 
     async def receive(self) -> UpstreamWebSocketMessage:
         message = await self._wrapped.receive()
+        if message.text is not None:
+            archive_text(
+                direction="upstream_raw_receive", kind="wire_capture", transport="websocket", text=message.text
+            )
+        elif message.data is not None:
+            archive_bytes(
+                direction="upstream_raw_receive", kind="wire_capture", transport="websocket", data=message.data
+            )
         return message
 
     def archive_received(self, message: UpstreamWebSocketMessage) -> None:
