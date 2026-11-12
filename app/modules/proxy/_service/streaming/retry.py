@@ -23,6 +23,7 @@ from app.core.clients.proxy import (
     _is_native_codex_request,
     _resolve_stream_transport,
     is_confirmed_pre_dispatch_transport_error,
+    is_undispatched_upstream_rejection,
     pop_stream_timeout_overrides,
 )
 from app.core.clients.thread_cache_identity import (
@@ -2323,9 +2324,17 @@ class _StreamingRetryMixin:
                                     if register_payload_owner:
                                         payload_replay_required_account_id = account.id
                                 except BaseException as exc:
+                                    # Bind the body to this account only when
+                                    # it may have reached upstream: a proven
+                                    # pre-dispatch failure (dead route or a
+                                    # refused WebSocket upgrade) leaves it free
+                                    # to make its first real dispatch elsewhere.
                                     if register_payload_owner and not (
                                         isinstance(exc, ProxyResponseError)
-                                        and is_confirmed_pre_dispatch_transport_error(exc)
+                                        and (
+                                            is_confirmed_pre_dispatch_transport_error(exc)
+                                            or is_undispatched_upstream_rejection(exc)
+                                        )
                                     ):
                                         payload_replay_required_account_id = account.id
                                     raise

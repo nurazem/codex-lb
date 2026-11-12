@@ -682,6 +682,26 @@ def is_confirmed_pre_dispatch_transport_error(exc: ProxyResponseError) -> bool:
     return error_code != PROCESS_NETWORK_UNAVAILABLE_CODE
 
 
+# ``ProxyResponseError.failure_phase`` for a WebSocket upgrade upstream refused.
+WEBSOCKET_HANDSHAKE_FAILURE_PHASE = "handshake"
+
+
+def is_undispatched_upstream_rejection(exc: ProxyResponseError) -> bool:
+    """Return whether upstream refused the request before its body was sent.
+
+    A WebSocket upgrade answered with a non-101 status (a bare 403 surfaces as
+    "Invalid response status") is rejected before the ``response.create``
+    frame is written, so the selected account never received the request.
+    Unlike ``is_confirmed_pre_dispatch_transport_error`` this says nothing
+    about the account's route being dead and grants no same-account retry or
+    route backoff; it only means the request body is not bound to that
+    account, so a movable request may fail over like any other pre-dispatch
+    failure.
+    """
+
+    return exc.failure_phase == WEBSOCKET_HANDSHAKE_FAILURE_PHASE
+
+
 def _process_network_failure_error(
     message: str,
     exc: Exception,
@@ -4447,7 +4467,15 @@ async def _stream_responses_with_session(
                     response_error_code = cast(str, error_code)
                     response_error_message = cast(str, error_message)
                     if raise_for_status:
-                        raise ProxyResponseError(exc.status, error_payload) from exc
+                        # The upgrade was refused, so ``response.create`` was
+                        # never written: mark the failure as undispatched.
+                        raise ProxyResponseError(
+                            exc.status,
+                            error_payload,
+                            failure_phase=WEBSOCKET_HANDSHAKE_FAILURE_PHASE,
+                            failure_detail="websocket_handshake_rejected",
+                            upstream_status_code=exc.status,
+                        ) from exc
                     yield format_local_sse_event(
                         synthetic_stream_failure_event(
                             response_error_code, response_error_message, response_id=get_request_id()
