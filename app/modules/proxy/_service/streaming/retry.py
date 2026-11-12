@@ -73,7 +73,9 @@ from app.modules.proxy._service.support import (
     _LOCAL_ACCOUNT_CAP_ERROR_CODES,
     _account_capacity_wait_payload,
     _account_selection_recovery_sleep_seconds,
+    _hold_admission_prelude,
     _request_log_client_fields,
+    _requests_background_mode,
     _RetryableStreamError,
     _signal_propagated_capacity_startup_wait,
     _signal_propagated_responses_service_cleanup_ready,
@@ -2313,19 +2315,22 @@ class _StreamingRetryMixin:
                                 tool_call_dedupe=tool_call_dedupe,
                                 enforce_openai_sdk_contract=enforce_openai_sdk_contract,
                                 thread_cache_identity=ThreadCacheIdentity(thread_cache_identity_mode, account.id),
-                                # Only a request that may still move to another
-                                # account holds its prelude for an admission
-                                # refusal; hard continuity owners never do.
-                                retry_overload_admission_refusal=(
-                                    allow_retry_flag
-                                    and routing_strategy != "single_account"
-                                    and account.id != account_model_replacement_account_id
-                                    and not _stream_owner_bound_to(account)
-                                ),
+                            )
+                            # Only an attempt that may still move to another
+                            # account holds its lifecycle prelude so an overload
+                            # refusal can fail over; hard owners never do.
+                            attempt_lines: AsyncIterator[str] = (
+                                _hold_admission_prelude(inner_stream, scheduler=scheduler, clock=clock)
+                                if allow_retry_flag
+                                and routing_strategy != "single_account"
+                                and account.id != account_model_replacement_account_id
+                                and not _stream_owner_bound_to(account)
+                                and not _requests_background_mode(payload)
+                                else inner_stream
                             )
                             try:
                                 try:
-                                    async for line in inner_stream:
+                                    async for line in attempt_lines:
                                         if register_payload_owner:
                                             payload_replay_required_account_id = account.id
                                             register_payload_owner = False
@@ -2334,10 +2339,11 @@ class _StreamingRetryMixin:
                                         payload_replay_required_account_id = account.id
                                 except BaseException as exc:
                                     # Bind the body to this account only when
-                                    # it may have reached upstream: a proven
-                                    # pre-dispatch failure (dead route or a
-                                    # refused WebSocket upgrade) leaves it free
-                                    # to make its first real dispatch elsewhere.
+                                    # upstream may have acted on it: a proven
+                                    # pre-dispatch failure (dead route, refused
+                                    # WebSocket upgrade) or an explicit overload
+                                    # refusal before output leaves it free to
+                                    # be sent elsewhere.
                                     if register_payload_owner and not (
                                         (
                                             isinstance(exc, ProxyResponseError)

@@ -263,15 +263,12 @@ from app.modules.proxy._service.observability import (
     _truncate_identifier as _truncate_identifier,
 )
 from app.modules.proxy._service.streaming.helpers import (
-    _ADMISSION_PRELUDE_EVENT_TYPES,
     _classify_terminal_stream_error_frame,
-    _is_output_free_overload_refusal,
     _mark_downstream_stream_cancelled,
     _mark_upstream_stream_incomplete,
     _observe_terminal_stream_error_frame,
     _openai_error_fields,
     _publish_http_response_owner,
-    _requests_background_mode,
     _rewrite_malformed_stream_error_event,
     _stamp_terminal,
     _stream_transport_failure_event_or_raise,
@@ -496,19 +493,9 @@ class _StreamingMixin(_StreamingRetryMixin):
         tool_call_dedupe: _WebSocketUpstreamControl | None = None,
         enforce_openai_sdk_contract: bool = True,
         thread_cache_identity: ThreadCacheIdentity | None = None,
-        retry_overload_admission_refusal: bool = False,
     ) -> AsyncIterator[str]:
         proxy = cast(_StreamingServiceProtocol, self)
         clock = clock_for(proxy)
-        # ``retry_overload_admission_refusal``: the caller can still move this
-        # request to another account. Hold the output-free lifecycle prelude
-        # (``response.created`` / ``response.in_progress``) back so that an
-        # explicit overload refusal arriving before any output is retried
-        # elsewhere instead of being relayed under a visible response; any
-        # other event releases the prelude unchanged.
-        held_prelude: list[str] | None = (
-            [] if retry_overload_admission_refusal and not _requests_background_mode(payload) else None
-        )
         preserve_native_failure_lifecycle = not enforce_openai_sdk_contract and _is_native_codex_request(headers)
         account_id_value = account.id
         access_token = proxy._encryptor.decrypt(account.access_token_encrypted)
@@ -729,8 +716,6 @@ class _StreamingMixin(_StreamingRetryMixin):
                             failure_phase="upstream", failure_detail="upstream_eof_before_terminal_event"
                         )
                     settlement.account_health_error = _facade()._should_penalize_stream_error(code, error_message)
-                    if held_prelude is not None and _is_output_free_overload_refusal(code, first_payload):
-                        raise _RetryableStreamError(code, upstream_error, exclude_account=True, admission_refused=True)
                     if allow_retry and code == "stream_idle_timeout":
                         raise _RetryableStreamError(code, upstream_error, exclude_account=True)
                     if allow_retry and _facade()._is_security_work_authorization_required_error(code, error_message):
@@ -790,26 +775,14 @@ class _StreamingMixin(_StreamingRetryMixin):
                         latency_first_token_ms = _ttft_event_latency_ms(
                             event_type, first_payload, ttft_reasoning_deltas, attempt_started_at, now=clock.monotonic()
                         )
-                    if (
-                        held_prelude is not None
-                        and not terminal_event_seen
-                        and event_type in _ADMISSION_PRELUDE_EVENT_TYPES
-                    ):
-                        held_prelude.append(first)
-                    else:
-                        held_prelude = None
-                        settlement.downstream_visible = True
-                        if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
-                            settlement.downstream_text_visible = True
-                        yield first
+                    settlement.downstream_visible = True
+                    if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
+                        settlement.downstream_text_visible = True
+                    yield first
             if terminal_stream_error is not None:
                 raise terminal_stream_error
             async for line in iterator:
                 if verbatim_type := _verbatim_relay_event_type(line, latency_first_token_ms, ttft_reasoning_deltas):
-                    if held_prelude:
-                        for held_line in held_prelude:
-                            yield held_line
-                    held_prelude = None
                     await _touch_api_key_reservation()
                     if verbatim_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                         saw_text_delta = settlement.downstream_text_visible = True
@@ -820,7 +793,6 @@ class _StreamingMixin(_StreamingRetryMixin):
                 event_type = classify_event_type(event_payload)
                 event = parse_sse_event_payload(event_payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
                 _publish_http_response_owner(proxy, event, event_payload, line, account_id_value, api_key, session_id)
-                admission_refused = False
                 preserve_raw_sse_line = not enforce_openai_sdk_contract and event_type == "error"
                 malformed_error_rewrite = _rewrite_malformed_stream_error_event(
                     enforce_openai_sdk_contract=enforce_openai_sdk_contract,
@@ -908,9 +880,6 @@ class _StreamingMixin(_StreamingRetryMixin):
                             error_message = raw_error_message
                             settlement.error = upstream_error
                             settlement.record_success = False
-                            admission_refused = held_prelude is not None and _is_output_free_overload_refusal(
-                                error_code, event_payload
-                            )
                             if error_code == "stream_incomplete":
                                 failure_metadata = _RequestLogFailureMetadata(
                                     failure_phase="upstream",
@@ -935,19 +904,6 @@ class _StreamingMixin(_StreamingRetryMixin):
                     settlement.error = {"message": raw_error_message or "Upstream error"}
                     settlement.record_success = False
                     settlement.account_health_error = not saw_text_delta
-                    admission_refused = held_prelude is not None and _is_output_free_overload_refusal(
-                        error_code, event_payload
-                    )
-                if admission_refused:
-                    # Upstream refused to admit the turn before producing any
-                    # output and nothing has reached the client: let the retry
-                    # loop move the request to another account.
-                    raise _RetryableStreamError(
-                        error_code or "server_is_overloaded",
-                        cast(UpstreamError, settlement.error or {"message": error_message or "Upstream error"}),
-                        exclude_account=True,
-                        admission_refused=True,
-                    )
                 if event_type in ("response.completed", "response.incomplete"):
                     response = event.response if event is not None else None
                     usage = response.usage if response else None
@@ -986,34 +942,14 @@ class _StreamingMixin(_StreamingRetryMixin):
                     continue
                 if event_payload is not None and not preserve_raw_sse_line:
                     line = format_sse_event(event_payload)
-                if held_prelude is not None and event_type in _ADMISSION_PRELUDE_EVENT_TYPES:
-                    held_prelude.append(line)
-                    continue
-                if held_prelude:
-                    for held_line in held_prelude:
-                        yield held_line
-                held_prelude = None
                 settlement.downstream_visible = True
                 if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                     settlement.downstream_text_visible = True
                 terminal_event_seen = terminal_event_seen or _stamp_terminal(settlement, event_type, clock)
                 yield line
-            if held_prelude:
-                # The stream ended inside the prelude: release it unchanged.
-                for held_line in held_prelude:
-                    yield held_line
-                settlement.downstream_visible = True
-            held_prelude = None
             if not terminal_event_seen:
                 status, error_code, error_message, failure_metadata = _mark_upstream_stream_incomplete(settlement)
         except ProxyResponseError as exc:
-            if held_prelude:
-                # A held prelude means upstream accepted the turn; release it so
-                # the failure keeps its existing visible, non-replayed handling.
-                for held_line in held_prelude:
-                    yield held_line
-                settlement.downstream_visible = True
-            held_prelude = None
             response_create_lease.release()
             failure_metadata = _facade()._request_log_failure_metadata(exc)
             error = _parse_openai_error(exc.payload)
@@ -1067,18 +1003,13 @@ class _StreamingMixin(_StreamingRetryMixin):
                 )
             )
             return
-        except (_TerminalStreamError, _RetryableStreamError):
+        except _TerminalStreamError:
             raise
         except (asyncio.CancelledError, GeneratorExit):
             if not terminal_event_seen:
                 status, error_code, error_message, failure_metadata = _mark_downstream_stream_cancelled(settlement)
             raise
         except Exception:
-            if held_prelude:
-                for held_line in held_prelude:
-                    yield held_line
-                settlement.downstream_visible = True
-            held_prelude = None
             if settlement.downstream_visible:
                 status, error_code, error_message, failure_metadata = _mark_upstream_stream_incomplete(settlement)
                 yield _stream_transport_failure_event_or_raise(

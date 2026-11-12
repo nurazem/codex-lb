@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -33,13 +33,15 @@ from app.core.resilience.overload import is_local_overload_error_code
 from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute
 from app.core.utils.locks import fast_lock
-from app.core.utils.sse import sse_event_type_from_block
+from app.core.utils.shared_future import _await_task_deferring_cancellation, wait_on_shared_future
+from app.core.utils.sse import parse_sse_data_json, sse_event_type_from_block
 from app.db.models import Account, StickySessionKind
 from app.modules.api_keys.service import (
     ApiKeyData,
     ApiKeyRequestUsageBudget,
     ApiKeyUsageReservationData,
 )
+from app.modules.proxy._load_balancer.overload_backoff import UPSTREAM_OVERLOAD_CODES
 from app.modules.proxy.affinity import _AffinityPolicy
 from app.modules.proxy.affinity_observation import AffinityObservation
 from app.modules.proxy.helpers import _normalize_error_code, _parse_openai_error
@@ -2131,3 +2133,149 @@ def configured_upstream_stream_transport(dashboard_settings: Any) -> str:
 def upstream_websocket_transport_recently_failed() -> bool:
     marked_at = _upstream_ws_transport_failure_at
     return marked_at is not None and time.monotonic() - marked_at < UPSTREAM_WS_TRANSPORT_FAILURE_TTL_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Admission-refusal failover on the HTTP stream path
+# ---------------------------------------------------------------------------
+
+# Output-free lifecycle frames upstream sends before it decides whether to run
+# a turn. A movable HTTP stream attempt holds them back (see
+# ``_hold_admission_prelude``).
+_ADMISSION_PRELUDE_EVENT_TYPES = frozenset({"response.created", "response.in_progress"})
+# Longest the prelude is held while no further frame arrives. Production
+# refusals (2026-11-12) arrived 1.1-1.6 s (median) or 10-12 s after dispatch,
+# p95 12.4 s; the held prelude is released unchanged once this passes.
+_ADMISSION_PRELUDE_HOLD_SECONDS = 15.0
+
+
+def _requests_background_mode(payload: Any) -> bool:
+    extra = getattr(payload, "model_extra", None) or {}
+    return getattr(payload, "background", None) is True or extra.get("background") is True
+
+
+def _is_output_free_overload_refusal(code: str | None, event_payload: Mapping[str, Any] | None) -> bool:
+    """Whether a terminal frame is an explicit overload refusal that produced nothing.
+
+    ``server_is_overloaded`` / ``overloaded_error`` mean upstream refused to run
+    the turn. A terminal that still reports output items or billed output or
+    reasoning tokens is not treated as a refusal.
+    """
+    if code not in UPSTREAM_OVERLOAD_CODES:
+        return False
+    response = event_payload.get("response") if isinstance(event_payload, Mapping) else None
+    if not isinstance(response, Mapping):
+        return True
+    output = response.get("output")
+    if isinstance(output, list) and output:
+        return False
+    usage = response.get("usage")
+    if isinstance(usage, Mapping):
+        output_tokens = usage.get("output_tokens")
+        if isinstance(output_tokens, (int, float)) and not isinstance(output_tokens, bool) and output_tokens > 0:
+            return False
+        details = usage.get("output_tokens_details")
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, Mapping) else None
+        if (
+            isinstance(reasoning_tokens, (int, float))
+            and not isinstance(reasoning_tokens, bool)
+            and reasoning_tokens > 0
+        ):
+            return False
+    return True
+
+
+def _admission_refusal(event_type: str | None, payload: Mapping[str, Any] | None) -> _RetryableStreamError | None:
+    """The retryable error for an explicit, output-free overload refusal frame, else ``None``."""
+    if event_type not in ("response.failed", "error") or not isinstance(payload, Mapping):
+        return None
+    response = payload.get("response")
+    error = response.get("error") if isinstance(response, Mapping) else payload.get("error")
+    if not isinstance(error, Mapping):
+        error = payload
+    raw_code, raw_type = error.get("code"), error.get("type")
+    code = _normalize_error_code(
+        raw_code if isinstance(raw_code, str) else None, raw_type if isinstance(raw_type, str) else None
+    )
+    if not _is_output_free_overload_refusal(code, payload):
+        return None
+    message = error.get("message")
+    upstream_error = cast(
+        UpstreamError,
+        {"code": code, "message": message if isinstance(message, str) and message else "Upstream is overloaded"},
+    )
+    return _RetryableStreamError(code, upstream_error, exclude_account=True, admission_refused=True)
+
+
+async def _next_stream_line(iterator: AsyncIterator[str]) -> str:
+    return await iterator.__anext__()
+
+
+async def _hold_admission_prelude(
+    lines: AsyncIterator[str], *, scheduler: Scheduler, clock: Clock
+) -> AsyncIterator[str]:
+    """Hold ``response.created`` / ``response.in_progress`` until the turn shows it will run.
+
+    Wraps the lines one HTTP stream attempt delivers downstream. An explicit
+    overload refusal that follows only the prelude is raised as a retryable
+    admission refusal, so the retry loop moves the request to another account
+    before the client has seen anything. Any other line, the end of the
+    attempt, an error, or ``_ADMISSION_PRELUDE_HOLD_SECONDS`` without a line
+    releases the held prelude unchanged, so accepted work keeps its existing
+    visible, non-replayed handling. The next line is read in a scheduler task
+    (as the SSE keepalive injector does) so an expiring hold never cancels the
+    attempt. The caller keeps ownership of ``lines`` and closes it.
+    """
+    iterator = lines.__aiter__()
+    held: list[str] | None = []
+    hold_deadline = clock.monotonic() + _ADMISSION_PRELUDE_HOLD_SECONDS
+    pending: asyncio.Task[str] | None = None
+    try:
+        while True:
+            try:
+                if held:
+                    if pending is None:
+                        pending = scheduler.create_task(_next_stream_line(iterator))
+                    try:
+                        line = await wait_on_shared_future(
+                            pending, timeout=max(0.0, hold_deadline - clock.monotonic()), scheduler=scheduler
+                        )
+                    except TimeoutError:
+                        for held_line in held:
+                            yield held_line
+                        held = None
+                        line = await wait_on_shared_future(pending, scheduler=scheduler)
+                    pending = None
+                else:
+                    line = await iterator.__anext__()
+            except StopAsyncIteration:
+                pending = None
+                break
+            except Exception:
+                pending = None
+                for held_line in held or ():
+                    yield held_line
+                held = None
+                raise
+            if held is not None:
+                payload = parse_sse_data_json(line)
+                event_type = classify_event_type(payload)
+                if event_type in _ADMISSION_PRELUDE_EVENT_TYPES:
+                    held.append(line)
+                    continue
+                refusal = _admission_refusal(event_type, payload)
+                if refusal is not None:
+                    raise refusal
+                for held_line in held:
+                    yield held_line
+                held = None
+            yield line
+        for held_line in held or ():
+            yield held_line
+    finally:
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await _await_task_deferring_cancellation(pending)
+            except BaseException:
+                pass

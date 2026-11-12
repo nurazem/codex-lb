@@ -9,7 +9,8 @@
 - [x] 2.1 Hold `response.created` / `response.in_progress` for a movable, non-background attempt
 - [x] 2.2 Raise a retryable admission refusal for an output-free `server_is_overloaded` / `overloaded_error` terminal; release the prelude for anything else
 - [x] 2.3 Do not bind an account-bound body to the refusing account
-- [x] 2.4 Regression tests: failover with and without a prelude, refusal after output, billed refusal, bare `server_error`, previous-response owner
+- [x] 2.4 Regression tests: failover with and without a prelude, refusal after output, billed refusal, bare `server_error`, previous-response owner, refusal on every account, refusal after the hold expired
+- [x] 2.5 Hold above the attempt (in the retry loop), not in the streaming mixin: keeps the mixin at its line ratchet and releases the response-create slot on the first upstream frame; bound the hold at 15 s
 
 ## 3. Isolated accounts while a healthy account is only capped
 

@@ -26,6 +26,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, DashboardSettings, RequestLog, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.api_keys.service import ApiKeyUsageReservationData
+from app.modules.proxy._service import support as proxy_support_module
 from app.modules.proxy._service.streaming import retry as streaming_retry_module
 from app.modules.proxy.downstream_delivery import (
     OUTCOME_TERMINAL_AFTER_DISCONNECT,
@@ -1915,6 +1916,10 @@ async def test_http_previous_response_owner_is_ready_before_persistence(
     get_settings.cache_clear()
     monkeypatch.setattr(proxy_module, "get_settings", get_settings)
     monkeypatch.setattr(proxy_module.ProxyService, "_persist_request_log", delayed_persist)
+    # The origin pauses right after ``response.created``; a movable fresh
+    # request holds that prelude (bounded) in case upstream refuses the turn.
+    # Keep the hold short so the created event reaches the client promptly.
+    monkeypatch.setattr(proxy_support_module, "_ADMISSION_PRELUDE_HOLD_SECONDS", 0.2)
     server = uvicorn.Server(uvicorn.Config(app_instance, host="127.0.0.1", port=0, log_level="warning"))
     serve_task = asyncio.create_task(server.serve())
     try:
