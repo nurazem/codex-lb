@@ -22,7 +22,7 @@ from app.core.balancer import (
     TrafficClass,
     select_account,
 )
-from app.core.clock import Clock
+from app.core.clock import Clock, scheduler_for
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
@@ -2191,11 +2191,20 @@ def _isolation_capacity_wait_deadline(clock: Clock) -> float:
 
 
 async def _wait_for_capacity_release(owner: object, *, deadline: float, clock: Clock) -> bool:
-    """Wait for a lease release until ``deadline`` (monotonic); ``True`` when one happened."""
-    waiter = getattr(owner, "_wait_for_account_lease_release", None)
-    if waiter is None:
+    """Wait for an account lease release until ``deadline`` (monotonic).
+
+    The balancer swaps ``_lease_release_event`` on every release. ``True`` when
+    a release happened; ``False`` on timeout or for owners without the event.
+    """
+    released = getattr(owner, "_lease_release_event", None)
+    timeout = deadline - clock.monotonic()
+    if not isinstance(released, asyncio.Event) or timeout <= 0:
         return False
-    return bool(await waiter(timeout_seconds=deadline - clock.monotonic()))
+    try:
+        await scheduler_for(owner).wait_for(released.wait(), timeout)
+    except TimeoutError:
+        return False
+    return True
 
 
 def _filter_states_for_account_caps(

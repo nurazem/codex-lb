@@ -913,9 +913,10 @@ def test_archive_service_rejects_path_traversal(monkeypatch, tmp_path):
 # M5 conversation archive: the toggle is dashboard-managed and resolved from the
 # settings-cache snapshot (never the database) at the single ``archive_enabled``
 # gate every ``archive_*`` call site goes through.
+# Fork: full provider wire capture adds two raw-capture sites to each client.
 _UPSTREAM_CLIENT_CALL_SITES = {
-    "app/core/clients/proxy.py": 15,
-    "app/core/clients/proxy_websocket.py": 5,
+    "app/core/clients/proxy.py": 17,
+    "app/core/clients/proxy_websocket.py": 7,
 }
 _ARCHIVE_CALL_RE = re.compile(r"\barchive_(?:json|text|bytes)\(")
 

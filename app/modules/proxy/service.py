@@ -727,9 +727,7 @@ from app.modules.proxy.affinity import (
     _sticky_key_for_thread_goal_request,
     _sticky_key_from_session_header,  # noqa: F401
 )
-from app.modules.proxy.affinity import (
-    _owner_lookup_session_id_from_headers as _owner_lookup_session_id_from_headers,
-)
+from app.modules.proxy.affinity import _owner_lookup_session_id_from_headers as _owner_lookup_session_id_from_headers
 from app.modules.proxy.affinity import (
     _sticky_key_for_responses_request as _sticky_key_for_responses_request,
 )
