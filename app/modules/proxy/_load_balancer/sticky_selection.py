@@ -505,6 +505,10 @@ async def run_sticky_selection_path(
     attempt = 0
     suppress_recovery_probe_candidates = False
     pending_initial_owner_lookup = request.initial_sticky_owner_lookup
+    # Monotonic deadline of this selection's wait for a capped healthy
+    # candidate (see ``_isolated_pool_while_healthy_capped``); ``inf`` once the
+    # wait is spent, so it happens at most once per selection call.
+    isolation_capacity_wait_deadline: float | None = None
     while True:
         attempt += 1
         sticky_existing_is_legacy = isinstance(legacy_existing_account_id, str)
@@ -771,7 +775,44 @@ async def run_sticky_selection_path(
                     traffic_class=traffic_class,
                     now=owner._clock.time(),
                 )
+            # Hard owners never move, so only fresh and soft-sticky selection
+            # waits for a healthy candidate instead of an isolated one.
+            wait_for_healthy_capacity = (
+                not hard_sticky
+                and fair_share_denial is None
+                and lease_kind is not None
+                and isolation_capacity_wait_deadline != float("inf")
+                and _isolated_pool_while_healthy_capped(
+                    states,
+                    selection_states,
+                    owner._runtime,
+                    traffic_class=traffic_class,
+                    now=owner._clock.time(),
+                )
+            )
             probe_reservation: ProbeReservation | None = None
+        if wait_for_healthy_capacity:
+            if isolation_capacity_wait_deadline is None:
+                isolation_capacity_wait_deadline = _isolation_capacity_wait_deadline(owner._clock)
+                logger.info(
+                    "Waiting for a healthy account's capacity before selecting an overload-isolated account "
+                    "lease_kind=%s candidates=%s wait_seconds=%.0f",
+                    lease_kind,
+                    len(states),
+                    ISOLATION_CAPACITY_WAIT_SECONDS,
+                )
+            if await _wait_for_capacity_release(owner, deadline=isolation_capacity_wait_deadline, clock=owner._clock):
+                # Re-evaluate with fresh runtime: the waiting iteration does not
+                # count toward the stale-state retry budget.
+                attempt -= 1
+                continue
+            isolation_capacity_wait_deadline = float("inf")
+            logger.info(
+                "No healthy account freed capacity in time; selecting from overload-isolated accounts lease_kind=%s",
+                lease_kind,
+            )
+            attempt -= 1
+            continue
         # Raw sticky rows are global, while account-assigned API keys and
         # other authenticated policies narrow a request's mutation authority.
         # Keep this check on the pre-health continuity pool: quota exhaustion
@@ -2089,6 +2130,72 @@ async def _restore_sticky_mutation(
         expected_account_id=expected_account_id,
         restore_account_id=sticky_existing_account_id if isinstance(sticky_existing_account_id, str) else None,
     )
+
+
+# Fresh and soft-sticky selection waits at most this long for a slot on a
+# healthy candidate that is only at its per-account cap before it selects an
+# overload-isolated account instead. A routing invariant, not an operator knob:
+# long enough for a typical stream on a busy account to finish, short enough
+# that a saturated pool still degrades to the isolated accounts quickly.
+ISOLATION_CAPACITY_WAIT_SECONDS = 10.0
+
+
+def _state_hard_blocked(state: AccountState, now: float) -> bool:
+    """Whether selection can never pick ``state`` right now (status, quota or cooldown)."""
+    if state.status in (AccountStatus.DEACTIVATED, AccountStatus.PAUSED):
+        return True
+    if (
+        state.status in (AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED)
+        and not state.ignore_standard_quota
+        and not (state.reset_at and now >= state.reset_at)
+    ):
+        return True
+    return bool(state.cooldown_until and now < state.cooldown_until)
+
+
+def _isolated_pool_while_healthy_capped(
+    states: list[AccountState],
+    selection_states: list[AccountState],
+    runtime_by_account_id: Mapping[str, RuntimeState],
+    *,
+    traffic_class: TrafficClass,
+    now: float,
+) -> bool:
+    """Whether the only selectable candidates left after the per-account caps
+    are overload-isolated while a healthy candidate was dropped by the caps alone.
+
+    The overload window never empties the pool, so without this the isolated
+    accounts are selected the moment the healthy account reaches its cap, and
+    upstream keeps refusing those fresh admissions.
+    """
+    live = [state for state in selection_states if not _state_hard_blocked(state, now)]
+    if not live or not all(
+        overload_isolation_active(runtime_by_account_id.get(state.account_id), now) for state in live
+    ):
+        return False
+    eligible_ids = {state.account_id for state in selection_states}
+    capped_healthy = [
+        state
+        for state in states
+        if state.account_id not in eligible_ids
+        and not overload_backoff_active(runtime_by_account_id.get(state.account_id), now)
+    ]
+    return any(
+        _pool_has_available_account_without_backoff([state], traffic_class=traffic_class, now=now)
+        for state in capped_healthy
+    )
+
+
+def _isolation_capacity_wait_deadline(clock: Clock) -> float:
+    return clock.monotonic() + ISOLATION_CAPACITY_WAIT_SECONDS
+
+
+async def _wait_for_capacity_release(owner: object, *, deadline: float, clock: Clock) -> bool:
+    """Wait for a lease release until ``deadline`` (monotonic); ``True`` when one happened."""
+    waiter = getattr(owner, "_wait_for_account_lease_release", None)
+    if waiter is None:
+        return False
+    return bool(await waiter(timeout_seconds=deadline - clock.monotonic()))
 
 
 def _filter_states_for_account_caps(

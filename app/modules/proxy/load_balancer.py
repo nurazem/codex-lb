@@ -311,6 +311,10 @@ class LoadBalancer:
         self._clock = clock
         self._runtime: dict[str, RuntimeState] = {}
         self._runtime_lock = asyncio.Lock()
+        # Set (and replaced) whenever an account lease is released, so a
+        # selection waiting for capacity on a saturated healthy account wakes
+        # as soon as a slot frees up.
+        self._lease_release_event = asyncio.Event()
         self._account_locks: dict[str, asyncio.Lock] = {}
         self._account_locks_registry_lock = asyncio.Lock()
         self._selection_inputs_cache = get_account_selection_cache()
@@ -327,6 +331,17 @@ class LoadBalancer:
     def current_routing_tunables(self) -> RoutingTunables:
         """Routing/overload knobs as of the most recent request-path snapshot."""
         return self._routing_tunables or effective_routing_tunables()
+
+    async def _wait_for_account_lease_release(self, *, timeout_seconds: float) -> bool:
+        """Wait until any account lease is released; ``False`` on timeout."""
+        if timeout_seconds <= 0:
+            return False
+        released = self._lease_release_event
+        try:
+            await asyncio.wait_for(released.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            return False
+        return True
 
     async def release_account_lease(self, lease: AccountLease | None) -> None:
         if lease is None:
@@ -520,6 +535,8 @@ class LoadBalancer:
         current = apply_lease_release(runtime, lease)
         if current is None:
             return False
+        released, self._lease_release_event = self._lease_release_event, asyncio.Event()
+        released.set()
         _record_account_lease_released(current.kind, reason)
         _record_account_inflight_leases(current.account_id, runtime)
         if reason == "stale":

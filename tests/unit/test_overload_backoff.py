@@ -1771,15 +1771,22 @@ def _isolate(balancer: LoadBalancer, account_id: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_isolated_bare_session_owner_is_kept_when_the_only_sibling_is_at_cap_and_spillover_is_off() -> None:
+async def test_isolated_bare_session_owner_is_kept_when_the_only_sibling_is_at_cap_and_spillover_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Request path: with cap spillover disabled the owner keeps its cap
     exemption and the isolation reroute must not pick a saturated sibling
     that lease admission then rejects (``account_stream_cap``) while the
     isolated owner still had capacity."""
+    from app.modules.proxy._load_balancer import sticky_selection as sticky_selection_module
     from tests.unit.test_load_balancer_concurrency import (
         _codex_session_selection_key,
         _make_cap_spillover_balancer,
     )
+
+    # Selection first waits (bounded) for the saturated healthy sibling; no
+    # slot frees here, so keep that wait short.
+    monkeypatch.setattr(sticky_selection_module, "ISOLATION_CAPACITY_WAIT_SECONDS", 0.05)
 
     balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("iso-cap-off")
     assert alternate is not None

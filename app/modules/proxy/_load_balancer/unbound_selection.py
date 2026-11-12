@@ -18,6 +18,7 @@ from app.core.balancer import (
 from app.db.models import Account, AccountStatus
 from app.modules.proxy._load_balancer.overload_backoff import filter_overload_backoff_candidates
 from app.modules.proxy._load_balancer.sticky_selection import (
+    ISOLATION_CAPACITY_WAIT_SECONDS,
     SelectionInputsProtocol,
     StickySelectionOwner,
     _account_cap_error_code,
@@ -25,8 +26,11 @@ from app.modules.proxy._load_balancer.sticky_selection import (
     _clone_account,
     _filter_recovery_probe_candidates,
     _filter_states_for_account_caps,
+    _isolated_pool_while_healthy_capped,
+    _isolation_capacity_wait_deadline,
     _probing_result_requires_recovery_reservation,
     _select_account_preferring_budget_safe,
+    _wait_for_capacity_release,
 )
 from app.modules.proxy._load_balancer.tunables import RoutingTunables
 from app.modules.proxy._load_balancer.types import (
@@ -149,7 +153,23 @@ async def run_unbound_selection_path(
 
     attempt = 0
     suppress_recovery_probe_candidates = False
+    # See ``run_sticky_selection_path``: one bounded wait per selection call for
+    # a capped healthy candidate before an overload-isolated one is selected.
+    isolation_capacity_wait_deadline: float | None = None
+    pending_capacity_wait = False
     while True:
+        if pending_capacity_wait:
+            pending_capacity_wait = False
+            assert isolation_capacity_wait_deadline is not None
+            if not await _wait_for_capacity_release(
+                owner, deadline=isolation_capacity_wait_deadline, clock=owner._clock
+            ):
+                isolation_capacity_wait_deadline = float("inf")
+                logger.info(
+                    "No healthy account freed capacity in time; selecting from overload-isolated accounts "
+                    "lease_kind=%s",
+                    lease_kind,
+                )
         attempt += 1
         probe_reservation: ProbeReservation | None = None
         probe_reservation_invalidated = False
@@ -192,6 +212,32 @@ async def run_unbound_selection_path(
                     traffic_class=traffic_class,
                     now=selection_now,
                 )
+            if (
+                fair_share_denial is None
+                and lease_kind is not None
+                and isolation_capacity_wait_deadline != float("inf")
+                and _isolated_pool_while_healthy_capped(
+                    states,
+                    selection_states,
+                    owner._runtime,
+                    traffic_class=traffic_class,
+                    now=selection_now,
+                )
+            ):
+                if isolation_capacity_wait_deadline is None:
+                    isolation_capacity_wait_deadline = _isolation_capacity_wait_deadline(owner._clock)
+                    logger.info(
+                        "Waiting for a healthy account's capacity before selecting an overload-isolated account "
+                        "lease_kind=%s candidates=%s wait_seconds=%.0f",
+                        lease_kind,
+                        len(states),
+                        ISOLATION_CAPACITY_WAIT_SECONDS,
+                    )
+                # Wait outside the runtime lock, then re-evaluate from fresh
+                # runtime; the waiting iteration is not a stale-state retry.
+                pending_capacity_wait = True
+                attempt -= 1
+                continue
             if fair_share_denial is not None:
                 # Gate and acquire share this lock section, so the denial is
                 # atomic — no commit-phase re-check is needed on this path.
