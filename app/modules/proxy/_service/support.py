@@ -2139,10 +2139,60 @@ def upstream_websocket_transport_recently_failed() -> bool:
 # Admission-refusal failover on the HTTP stream path
 # ---------------------------------------------------------------------------
 
-# Output-free lifecycle frames upstream sends before it decides whether to run
-# a turn. A movable HTTP stream attempt holds them back (see
-# ``_hold_admission_prelude``).
-_ADMISSION_PRELUDE_EVENT_TYPES = frozenset({"response.created", "response.queued", "response.in_progress"})
+# A movable HTTP stream attempt holds every frame upstream sends until one shows
+# the turn is running (see ``_hold_admission_prelude``). The hold is a
+# deny-list on purpose: upstream keeps adding output-free frames before the
+# refusal (``codex.rate_limits``, ``responsesapi.websocket_timing``,
+# ``response.metadata``), so anything not known to carry model output or to
+# commit the turn is held. The lists below come from the stream handling in this
+# repo (``_MODEL_OUTPUT_EVENT_TYPES``, ``_TTFT_*_EVENT_TYPES``,
+# ``_MUST_PARSE_STREAM_EVENT_TYPES``, ``_SSE_EVENT_TYPE_ALIASES``, the public
+# normalizer) and the Responses streaming event families.
+#
+# Terminal frames: they commit or end the turn. ``response.failed`` / ``error``
+# are first checked for an output-free overload refusal.
+_ADMISSION_HOLD_TERMINAL_EVENT_TYPES = frozenset(
+    {"response.completed", "response.incomplete", "response.failed", "error"}
+)
+# Event families that carry model output (text, reasoning, tool calls, audio,
+# images, built-in tool progress). Matched as prefixes of the event type.
+_ADMISSION_HOLD_OUTPUT_EVENT_PREFIXES = (
+    "response.output_item.",
+    "response.output_text.",
+    "response.output_audio.",
+    "response.output_audio_transcript.",
+    "response.output_tool_call.",
+    "response.content_part.",
+    "response.text.",
+    "response.audio.",
+    "response.audio_transcript.",
+    "response.refusal.",
+    # reasoning_text.*, reasoning_summary_text.*, reasoning_summary_part.*, reasoning.*
+    "response.reasoning",
+    "response.function_call_arguments.",
+    "response.custom_tool_call_input.",
+    "response.image_generation_call.",
+    "response.web_search_call.",
+    "response.file_search_call.",
+    # code_interpreter_call.* and code_interpreter_call_code.*
+    "response.code_interpreter_call",
+    # mcp_call.*, mcp_call_arguments.*, mcp_list_tools.*
+    "response.mcp_",
+)
+# Payload fields that only output frames carry (item and content addressing,
+# streamed text). A frame of an unknown type that carries one of them is
+# treated as output; ``_pre_created_buffer_has_indexed_lifecycle`` in the API
+# layer uses the same addressing fields.
+_ADMISSION_HOLD_OUTPUT_FIELDS = (
+    "item",
+    "item_id",
+    "output_index",
+    "content_index",
+    "summary_index",
+    "part",
+    "delta",
+    "text",
+)
 # Longest the prelude is held while no further frame arrives. Production
 # refusals (2026-11-12) arrived 1.1-1.6 s (median) or 10-12 s after dispatch,
 # p95 12.4 s; the held prelude is released unchanged once this passes.
@@ -2152,20 +2202,52 @@ _ADMISSION_PRELUDE_HOLD_SECONDS = 15.0
 _OVERLOAD_LINE_MARKER = "overloaded"
 
 
-def _is_admission_prelude_event(event_type: str | None) -> bool:
-    """Whether a frame says nothing about the turn running: lifecycle prelude or vendor telemetry.
+def _ends_admission_hold(event_type: str | None, payload: Mapping[str, Any] | None) -> bool:
+    """Whether a frame shows the turn is running (output or a terminal), so the hold must end.
 
-    Upstream sends vendor telemetry beside the lifecycle prelude: over the
-    WebSocket transport every Codex turn starts with ``codex.rate_limits``
-    before ``response.created``, and ``responsesapi.websocket_timing`` can
-    follow. Such frames carry no model output (public Responses streams drop
-    them, see ``_normalize_public_stream_payload``), so they are held with the
-    prelude instead of ending the hold. ``error`` and every other
-    ``response.*`` frame are not telemetry.
+    Every other frame is held: the lifecycle prelude (``response.created`` /
+    ``queued`` / ``in_progress``), ``response.metadata`` (turn-state headers,
+    moderation, verification and safety-buffering notices), vendor telemetry
+    such as ``codex.rate_limits`` and ``responsesapi.websocket_timing``, and
+    output-free types upstream adds later. A line that does not parse as an
+    event ends the hold. Any ``*.delta`` ends it, as does a frame whose
+    response snapshot already reports output or billed output/reasoning tokens.
     """
-    if event_type in _ADMISSION_PRELUDE_EVENT_TYPES:
+    if not isinstance(event_type, str) or not event_type:
         return True
-    return isinstance(event_type, str) and event_type not in ("", "error") and not event_type.startswith("response.")
+    if event_type in _ADMISSION_HOLD_TERMINAL_EVENT_TYPES:
+        return True
+    if event_type.startswith(_ADMISSION_HOLD_OUTPUT_EVENT_PREFIXES) or event_type.endswith(".delta"):
+        return True
+    if not isinstance(payload, Mapping):
+        return True
+    if any(payload.get(field) is not None for field in _ADMISSION_HOLD_OUTPUT_FIELDS):
+        return True
+    return _response_snapshot_reports_output(payload)
+
+
+def _response_snapshot_reports_output(event_payload: Mapping[str, Any] | None) -> bool:
+    """Whether a frame's ``response`` snapshot reports output items or billed output/reasoning tokens."""
+    response = event_payload.get("response") if isinstance(event_payload, Mapping) else None
+    if not isinstance(response, Mapping):
+        return False
+    output = response.get("output")
+    if isinstance(output, list) and output:
+        return True
+    usage = response.get("usage")
+    if isinstance(usage, Mapping):
+        output_tokens = usage.get("output_tokens")
+        if isinstance(output_tokens, (int, float)) and not isinstance(output_tokens, bool) and output_tokens > 0:
+            return True
+        details = usage.get("output_tokens_details")
+        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, Mapping) else None
+        if (
+            isinstance(reasoning_tokens, (int, float))
+            and not isinstance(reasoning_tokens, bool)
+            and reasoning_tokens > 0
+        ):
+            return True
+    return False
 
 
 def _requests_background_mode(payload: Any) -> bool:
@@ -2182,26 +2264,7 @@ def _is_output_free_overload_refusal(code: str | None, event_payload: Mapping[st
     """
     if code not in UPSTREAM_OVERLOAD_CODES:
         return False
-    response = event_payload.get("response") if isinstance(event_payload, Mapping) else None
-    if not isinstance(response, Mapping):
-        return True
-    output = response.get("output")
-    if isinstance(output, list) and output:
-        return False
-    usage = response.get("usage")
-    if isinstance(usage, Mapping):
-        output_tokens = usage.get("output_tokens")
-        if isinstance(output_tokens, (int, float)) and not isinstance(output_tokens, bool) and output_tokens > 0:
-            return False
-        details = usage.get("output_tokens_details")
-        reasoning_tokens = details.get("reasoning_tokens") if isinstance(details, Mapping) else None
-        if (
-            isinstance(reasoning_tokens, (int, float))
-            and not isinstance(reasoning_tokens, bool)
-            and reasoning_tokens > 0
-        ):
-            return False
-    return True
+    return not _response_snapshot_reports_output(event_payload)
 
 
 def _overload_terminal(
@@ -2262,13 +2325,15 @@ async def _hold_admission_prelude(
     """Hold the output-free prelude until the turn shows it will run.
 
     Wraps the lines one HTTP stream attempt delivers downstream. The prelude is
-    ``response.created`` / ``response.queued`` / ``response.in_progress`` plus
-    any vendor telemetry around them (``_is_admission_prelude_event``). An
-    explicit overload refusal that follows only the prelude is raised as a
-    retryable admission refusal, so the retry loop moves the request to another
-    account before the client has seen anything. Any other line, the end of the
-    attempt, an error, or ``_ADMISSION_PRELUDE_HOLD_SECONDS`` without a line
-    releases the held prelude unchanged and in order, so accepted work keeps
+    every frame up to the first one that shows the turn is running
+    (``_ends_admission_hold``): ``response.created`` / ``queued`` /
+    ``in_progress``, ``response.metadata``, vendor telemetry and unknown
+    output-free types. An explicit overload refusal that follows only the
+    prelude is raised as a retryable admission refusal, so the retry loop moves
+    the request to another account before the client has seen anything. An
+    output frame, any other terminal or error, an unparsed line, the end of the
+    attempt, or ``_ADMISSION_PRELUDE_HOLD_SECONDS`` without a line releases the
+    held prelude unchanged and in order, so accepted work keeps
     its existing visible, non-replayed handling. The next line is read in a
     scheduler task (as the SSE keepalive injector does) so an expiring hold
     never cancels the attempt. The caller keeps ownership of ``lines`` and
@@ -2314,7 +2379,7 @@ async def _hold_admission_prelude(
             if held is not None:
                 payload = parse_sse_data_json(line)
                 event_type = classify_event_type(payload)
-                if _is_admission_prelude_event(event_type):
+                if not _ends_admission_hold(event_type, payload):
                     held.append(line)
                     continue
                 refusal = _admission_refusal(event_type, payload)

@@ -759,3 +759,308 @@ async def test_relayed_overload_refusal_on_last_attempt_logs_no_attempts_left(mo
     # Only the last account's refusal reaches the client.
     assert [event["type"] for event in _events(chunks)] == ["codex.rate_limits", "response.created", "response.failed"]
     assert _not_failed_over_reasons(caplog) == ["no_attempts_left"]
+
+
+# ---------------------------------------------------------------------------
+# The hold ends only on output or a terminal; every other frame is held
+# ---------------------------------------------------------------------------
+#
+# Production (2026-11-12 22:32 UTC onward, image rebase-62ebae1): every one of
+# 28 overload refusals on Codex CLI turns over the WebSocket upstream was
+# relayed with ``released_by_event:response.metadata``. Upstream sends
+# ``response.metadata`` (turn-state headers, moderation/verification/safety
+# notices; no model output) after ``response.created`` and before the
+# refusal, and the hold treated every unknown ``response.*`` frame as output.
+
+
+def _response_metadata(turn_state: str, **fields: object) -> str:
+    return _sse(
+        {
+            "type": "response.metadata",
+            "headers": {"x-codex-turn-state": turn_state, "openai-model": "gpt-5.1"},
+            **fields,
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("native", [True, False], ids=["native_codex", "sdk_contract"])
+@pytest.mark.parametrize(
+    "sequence",
+    ["observed", "metadata_with_notices_and_telemetry", "metadata_before_created"],
+)
+async def test_codex_turn_overload_refusal_after_response_metadata_fails_over(monkeypatch, caplog, native, sequence):
+    refusing = _make_account("acc_metadata_overloaded")
+    healthy = _make_account("acc_metadata_healthy")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        if account_id == refusing.chatgpt_account_id:
+            yield _rate_limits()
+            if sequence == "metadata_before_created":
+                yield _response_metadata("ts-refused")
+                yield _created("resp_refused")
+            else:
+                yield _created("resp_refused")
+                yield _response_metadata("ts-refused")
+            if sequence == "metadata_with_notices_and_telemetry":
+                yield _sse(
+                    {
+                        "type": "response.metadata",
+                        "sequence_number": 2,
+                        "response_id": "resp_refused",
+                        "metadata": {"type": "safety_buffering", "use_cases": ["cyber"], "reasons": ["policy-check"]},
+                    }
+                )
+                yield _sse(
+                    {
+                        "type": "response.metadata",
+                        "response_id": "resp_refused",
+                        "metadata": {"openai_chatgpt_moderation_metadata": {"presentation": "inline"}},
+                    }
+                )
+                yield _websocket_timing()
+                yield _in_progress("resp_refused")
+            yield _overloaded("resp_refused")
+            return
+        yield _rate_limits()
+        yield _created("resp_served")
+        yield _response_metadata("ts-served")
+        yield _completed("resp_served")
+
+    service, select_account = _stream_service(monkeypatch, refusing, healthy, fake_stream=fake_stream)
+    record_error = AsyncMock()
+    monkeypatch.setattr(service._load_balancer, "record_error", record_error)
+    caplog.set_level("INFO")
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            _codex_follow_up_payload(),
+            dict(_CODEX_NATIVE_HEADERS) if native else {"session_id": "sid-codex-turn"},
+            enforce_openai_sdk_contract=not native,
+        )
+    ]
+    events = _events(chunks)
+
+    assert attempted == [refusing.chatgpt_account_id, healthy.chatgpt_account_id]
+    assert select_account.await_count == 2
+    assert refusing.id in select_account.await_args_list[1].kwargs["exclude_account_ids"]
+    joined = "".join(chunks)
+    assert "resp_refused" not in joined
+    assert "server_is_overloaded" not in joined
+    # The refusing account's turn-state never reaches the client; the serving
+    # account's metadata frame does, unchanged and in upstream order.
+    assert "ts-refused" not in joined
+    assert [event["type"] for event in events] == [
+        "codex.rate_limits",
+        "response.created",
+        "response.metadata",
+        "response.completed",
+    ]
+    assert events[2]["headers"] == {"x-codex-turn-state": "ts-served", "openai-model": "gpt-5.1"}
+    assert [call.args[0].id for call in record_error.await_args_list] == [refusing.id]
+    assert _not_failed_over_reasons(caplog) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unknown_frame",
+    [
+        {"type": "response.routing_hint", "sequence_number": 2, "response_id": "resp_refused"},
+        {"type": "codex.future_notice", "status": "queued"},
+        {"type": "vendorx.timing", "server_ms": 4},
+    ],
+    ids=lambda frame: frame["type"],
+)
+async def test_unknown_output_free_frame_before_refusal_is_held_and_fails_over(monkeypatch, unknown_frame):
+    refusing = _make_account("acc_unknown_overloaded")
+    healthy = _make_account("acc_unknown_healthy")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        if account_id == refusing.chatgpt_account_id:
+            yield _rate_limits()
+            yield _created("resp_refused")
+            yield _sse(unknown_frame)
+            yield _overloaded("resp_refused")
+            return
+        yield _created("resp_served")
+        yield _sse(unknown_frame)
+        yield _completed("resp_served")
+
+    service, select_account = _stream_service(monkeypatch, refusing, healthy, fake_stream=fake_stream)
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            _codex_follow_up_payload(), dict(_CODEX_NATIVE_HEADERS), enforce_openai_sdk_contract=False
+        )
+    ]
+
+    assert attempted == [refusing.chatgpt_account_id, healthy.chatgpt_account_id]
+    assert select_account.await_count == 2
+    assert "server_is_overloaded" not in "".join(chunks)
+    assert [event["type"] for event in _events(chunks)] == [
+        "response.created",
+        unknown_frame["type"],
+        "response.completed",
+    ]
+
+
+_OUTPUT_FRAMES_BEFORE_REFUSAL: list[dict[str, object]] = [
+    {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {"id": "rs_1", "type": "reasoning", "summary": []},
+    },
+    {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {"id": "rs_1", "type": "reasoning", "summary": []},
+    },
+    {
+        "type": "response.content_part.added",
+        "item_id": "msg_1",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": ""},
+    },
+    {
+        "type": "response.content_part.done",
+        "item_id": "msg_1",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": "x"},
+    },
+    {"type": "response.output_text.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "x"},
+    {"type": "response.output_text.done", "item_id": "msg_1", "output_index": 0, "content_index": 0, "text": "x"},
+    {"type": "response.refusal.delta", "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "no"},
+    {"type": "response.reasoning_text.delta", "item_id": "rs_1", "output_index": 0, "content_index": 0, "delta": "t"},
+    {
+        "type": "response.reasoning_summary_part.added",
+        "item_id": "rs_1",
+        "output_index": 0,
+        "summary_index": 0,
+        "part": {"type": "summary_text", "text": ""},
+    },
+    {
+        "type": "response.reasoning_summary_text.delta",
+        "item_id": "rs_1",
+        "output_index": 0,
+        "summary_index": 0,
+        "delta": "t",
+    },
+    {
+        "type": "response.reasoning_summary_text.done",
+        "item_id": "rs_1",
+        "output_index": 0,
+        "summary_index": 0,
+        "text": "t",
+    },
+    {"type": "response.function_call_arguments.delta", "item_id": "fc_1", "output_index": 0, "delta": "{"},
+    {"type": "response.function_call_arguments.done", "item_id": "fc_1", "output_index": 0, "arguments": "{}"},
+    {"type": "response.custom_tool_call_input.delta", "item_id": "ct_1", "output_index": 0, "delta": "x"},
+    {"type": "response.output_tool_call.delta", "item_id": "tc_1", "output_index": 0, "delta": "x"},
+    {"type": "response.image_generation_call.in_progress", "item_id": "ig_1", "output_index": 0},
+    {"type": "response.web_search_call.searching", "item_id": "ws_1", "output_index": 0},
+    # Unknown types: a streamed delta, or output addressing, is output.
+    {"type": "response.future_part.delta", "delta": "x"},
+    {"type": "response.future_tool_call.in_progress", "item_id": "ft_1", "output_index": 0},
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "output_frame",
+    _OUTPUT_FRAMES_BEFORE_REFUSAL,
+    ids=lambda frame: str(frame["type"]) + ("" if "item_id" in frame or "item" in frame else "_bare"),
+)
+async def test_output_frame_before_refusal_releases_the_hold_and_is_not_moved(monkeypatch, caplog, output_frame):
+    first = _make_account("acc_output_runs")
+    second = _make_account("acc_output_unused")
+    attempted: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        attempted.append(account_id)
+        yield _rate_limits()
+        yield _created("resp_output")
+        yield _response_metadata("ts-output")
+        yield _sse(output_frame)
+        yield _overloaded("resp_output")
+
+    service, select_account = _stream_service(monkeypatch, first, second, fake_stream=fake_stream)
+    caplog.set_level("INFO")
+
+    chunks = [
+        chunk
+        async for chunk in service.stream_responses(
+            _codex_follow_up_payload(), dict(_CODEX_NATIVE_HEADERS), enforce_openai_sdk_contract=False
+        )
+    ]
+    event_types = [event["type"] for event in _events(chunks)]
+
+    assert attempted == [first.chatgpt_account_id]
+    assert select_account.await_count == 1
+    # Held frames are released unchanged and in upstream order before the output.
+    assert event_types[:3] == ["codex.rate_limits", "response.created", "response.metadata"]
+    assert event_types[-1] == "response.failed"
+    assert "server_is_overloaded" in "".join(chunks)
+    assert _not_failed_over_reasons(caplog) == [f"released_by_event:{output_frame['type']}"]
+
+
+@pytest.mark.parametrize(
+    ("frame", "ends_hold"),
+    [
+        ({"type": "response.created", "response": {"id": "r", "status": "in_progress", "output": []}}, False),
+        ({"type": "response.queued", "response": {"id": "r", "status": "queued"}}, False),
+        ({"type": "response.in_progress", "response": {"id": "r", "output": []}}, False),
+        ({"type": "response.metadata", "headers": {"x-codex-turn-state": "ts"}}, False),
+        ({"type": "response.metadata", "sequence_number": 1, "response_id": "r", "metadata": {}}, False),
+        ({"type": "codex.rate_limits", "plan_type": "pro", "rate_limits": {}}, False),
+        ({"type": "codex.response.metadata", "headers": {}}, False),
+        ({"type": "codex.keepalive"}, False),
+        ({"type": "responsesapi.websocket_timing", "server_ms": 3}, False),
+        ({"type": "response.some_future_event", "sequence_number": 4}, False),
+        ({"type": "response.completed", "response": {"id": "r", "output": []}}, True),
+        ({"type": "response.incomplete", "response": {"id": "r", "output": []}}, True),
+        ({"type": "response.failed", "response": {"id": "r", "output": []}}, True),
+        ({"type": "error", "error": {"code": "server_error"}}, True),
+        ({"error": {"code": "server_error"}}, True),
+        ({"type": "response.text.delta", "delta": "x"}, True),
+        ({"type": "response.audio.delta", "delta": "x"}, True),
+        ({"type": "response.output_audio_transcript.delta", "delta": "x"}, True),
+        ({"type": "response.reasoning_summary_part.done", "item_id": "rs"}, True),
+        ({"type": "response.code_interpreter_call_code.delta", "delta": "x"}, True),
+        ({"type": "response.mcp_call_arguments.done", "item_id": "m"}, True),
+        ({"type": "response.file_search_call.searching", "item_id": "f"}, True),
+        ({"type": "response.output_text.annotation.added", "item_id": "m"}, True),
+        # A prelude frame whose snapshot already reports output is output.
+        ({"type": "response.in_progress", "response": {"id": "r", "output": [{"type": "message"}]}}, True),
+        (
+            {
+                "type": "response.in_progress",
+                "response": {"id": "r", "output": [], "usage": {"output_tokens_details": {"reasoning_tokens": 2}}},
+            },
+            True,
+        ),
+        ({"type": ""}, True),
+        ({"no_type": True}, True),
+    ],
+)
+def test_ends_admission_hold_classification(frame, ends_hold):
+    from app.core.openai.parsing import classify_event_type
+    from app.modules.proxy._service import support as streaming_helpers
+
+    assert streaming_helpers._ends_admission_hold(classify_event_type(frame), frame) is ends_hold
+
+
+def test_unparsed_line_ends_admission_hold():
+    from app.modules.proxy._service import support as streaming_helpers
+
+    assert streaming_helpers._ends_admission_hold(None, None) is True

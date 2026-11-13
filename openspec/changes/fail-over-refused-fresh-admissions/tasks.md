@@ -15,6 +15,8 @@
 - [x] 2.6 Hold vendor telemetry (`codex.rate_limits`, `responsesapi.websocket_timing`, any non-`response.*` non-`error` type) and `response.queued` with the prelude: in production (2026-11-12 20:25 UTC) `codex.rate_limits` arrived before `response.created` on the WebSocket upstream and released the hold, so the refusal was relayed
 - [x] 2.7 Log `Overload refusal not failed over ... reason=<blocking condition>` whenever a refusal is relayed instead of failed over
 - [x] 2.8 Regression tests with a realistic Codex follow-up turn (encrypted reasoning, tool call/output, prompt_cache_key; native and SDK contract): telemetry before and inside the prelude fails over, telemetry is released in order when output starts, previous-response owner stays, and one log reason per relayed refusal
+- [x] 2.9 Invert the hold: end it only on output, a terminal, an unparsed line, end of stream or the 15 s bound, and hold every other frame. In production (2026-11-12 22:32 UTC onward) all 28 relayed refusals were `released_by_event:response.metadata`; this is the third output-free frame type found before the refusal
+- [x] 2.10 Regression tests: the observed `codex.rate_limits`, `response.created`, `response.metadata`, refusal sequence (native and SDK contract) fails over; unknown output-free types fail over; each output event family before the refusal is relayed without replay
 
 ## 3. Isolated accounts while a healthy account is only capped
 
